@@ -25,9 +25,10 @@ class HiFP8FakeQuantizedLinear(nn.Linear):
     Linear layer with HiFP8 fake quantization on weights and optionally activations.
 
     During forward pass:
-      1. Fake-quantize activation (if activation_fake_quantizer is set)
-      2. Fake-quantize weight (if weight_fake_quantizer is set)
-      3. F.linear(fq_activation, fq_weight, bias)
+      1. Apply SmoothQuant scaling (if smooth_scale is set): x = x / smooth_scale
+      2. Fake-quantize activation (if activation_fake_quantizer is set)
+      3. Fake-quantize weight (if weight_fake_quantizer is set)
+      4. F.linear(fq_activation, fq_weight, bias)
 
     Example::
 
@@ -57,17 +58,32 @@ class HiFP8FakeQuantizedLinear(nn.Linear):
             HiFP8FakeQuantizer(weight_config) if weight_config else None
         )
 
+        # Initialize buffer slots (will be registered when set)
+        # Note: We don't register_buffer with None, as PyTorch doesn't handle loading into None buffers
+        # Buffers are registered dynamically in set_smooth_scale() and set_static_scales()
+        self.smooth_scale = None
+        self.weight_static_scale = None
+        self.activation_static_scale = None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1. Apply SmoothQuant scaling
+        if self.smooth_scale is not None:
+            x = x / self.smooth_scale
+
+        # 2. Fake-quantize activation
         if self.activation_fake_quantizer is not None:
             x = self.activation_fake_quantizer(x)
+
+        # 3. Fake-quantize weight
         if self.weight_fake_quantizer is not None:
             w = self.weight_fake_quantizer(self.weight)
         else:
             w = self.weight
+
         return F.linear(x, w, self.bias)
 
     def to_linear(self) -> nn.Linear:
-        """Convert back to a standard nn.Linear (drop fake quantizers)."""
+        """Convert back to a standard nn.Linear (drop fake quantizers and smooth_scale)."""
         new_linear = nn.Linear(
             self.in_features,
             self.out_features,
@@ -79,6 +95,61 @@ class HiFP8FakeQuantizedLinear(nn.Linear):
             new_linear.weight = self.weight
             new_linear.bias = self.bias
         return new_linear
+
+    def set_smooth_scale(self, scale: Optional[torch.Tensor]) -> None:
+        """
+        Set SmoothQuant scale as a buffer for persistence.
+
+        Args:
+            scale: Smooth scale tensor or None to clear.
+        """
+        if scale is None:
+            self.smooth_scale = None
+        else:
+            scale_detached = scale.detach()
+            # Check if buffer already registered
+            if "smooth_scale" in self._buffers:
+                # Update existing buffer
+                self.smooth_scale = scale_detached
+            else:
+                # Delete regular attribute if it exists, then register as buffer
+                if hasattr(self, "smooth_scale"):
+                    delattr(self, "smooth_scale")
+                self.register_buffer("smooth_scale", scale_detached, persistent=True)
+
+    def set_static_scales(
+        self,
+        weight_scale: Optional[torch.Tensor] = None,
+        activation_scale: Optional[torch.Tensor] = None,
+    ) -> None:
+        """
+        Set static quantization scales as buffers for persistence.
+
+        Args:
+            weight_scale: Static scale for weight quantization or None.
+            activation_scale: Static scale for activation quantization or None.
+        """
+        if weight_scale is not None:
+            weight_scale_detached = weight_scale.detach()
+            # Check if buffer already registered
+            if "weight_static_scale" in self._buffers:
+                self.weight_static_scale = weight_scale_detached
+            else:
+                # Delete regular attribute if it exists, then register as buffer
+                if hasattr(self, "weight_static_scale"):
+                    delattr(self, "weight_static_scale")
+                self.register_buffer("weight_static_scale", weight_scale_detached, persistent=True)
+
+        if activation_scale is not None:
+            activation_scale_detached = activation_scale.detach()
+            # Check if buffer already registered
+            if "activation_static_scale" in self._buffers:
+                self.activation_static_scale = activation_scale_detached
+            else:
+                # Delete regular attribute if it exists, then register as buffer
+                if hasattr(self, "activation_static_scale"):
+                    delattr(self, "activation_static_scale")
+                self.register_buffer("activation_static_scale", activation_scale_detached, persistent=True)
 
     @classmethod
     def from_linear(

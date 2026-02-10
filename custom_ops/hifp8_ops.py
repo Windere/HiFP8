@@ -27,6 +27,10 @@ def hifp8_fake_quantize(
     *,
     granularity=None,
     target_dtype: Optional[torch.dtype] = None,
+
+
+
+    static_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     HiFP8 fake quantization: quantize to low precision then dequantize back,
@@ -39,8 +43,11 @@ def hifp8_fake_quantize(
         x: Input tensor (bf16 or fp32), must be on CUDA device.
         param1: Reserved for future HiFP8 kernel parameter.
         param2: Reserved for future HiFP8 kernel parameter.
-        granularity: Quantization granularity (PerRow, PerTensor). Default: PerRow().
+        granularity: Quantization granularity (PerRow, PerTensor, PerToken, PerAxis).
+                     Default: PerRow().
         target_dtype: Target FP8 dtype. Default: torch.float8_e4m3fn.
+        static_scale: Pre-computed scale for static quantization. When provided,
+                      skips dynamic scale computation. Default: None.
 
     Returns:
         Tensor in original dtype with simulated quantization noise.
@@ -56,13 +63,18 @@ def hifp8_fake_quantize(
         target_dtype = torch.float8_e4m3fn
 
     original_dtype = x.dtype
-    block_size = get_block_size(x.shape, granularity)
-
     # Placeholder: standard FP8 fake quantization
     # TODO: Replace with real HiFP8 CUDA kernel call
-    scale = _choose_scale_float8(x, block_size, target_dtype)
-    q = _quantize_affine_float8(x, scale, target_dtype)
-    dq = _dequantize_affine_float8(q, scale, original_dtype)
+    if static_scale is not None:
+        # Static quantization: use pre-computed scale
+        q = _quantize_affine_float8(x, static_scale, target_dtype)
+        dq = _dequantize_affine_float8(q, static_scale, original_dtype)
+    else:
+        # Dynamic quantization: compute scale each time
+        block_size = get_block_size(x.shape, granularity)
+        scale = _choose_scale_float8(x, block_size, target_dtype)
+        q = _quantize_affine_float8(x, scale, target_dtype)
+        dq = _dequantize_affine_float8(q, scale, original_dtype)
 
     return dq
 

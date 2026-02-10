@@ -38,6 +38,7 @@ class HiFP8FakeQuantizer(nn.Module):
             self.config.param2,
             granularity=self.config.granularity,
             target_dtype=self.config.target_dtype,
+            static_scale=self.config.static_scale,
         )
 
     def set_quantize_fn(self, fn):
@@ -45,13 +46,14 @@ class HiFP8FakeQuantizer(nn.Module):
         Swap the quantization function (e.g., to use real HiFP8 CUDA kernel).
 
         The function must match the signature:
-            fn(x, param1, param2, *, granularity, target_dtype) -> Tensor
+            fn(x, param1, param2, *, granularity, target_dtype, static_scale) -> Tensor
         """
         self._quantize_fn = fn
 
     def __repr__(self) -> str:
         return (
             f"HiFP8FakeQuantizer(enabled={self.enabled}, "
+            f"mode={self.config.mode.value}, "
             f"granularity={self.config.granularity}, "
             f"target_dtype={self.config.target_dtype})"
         )
