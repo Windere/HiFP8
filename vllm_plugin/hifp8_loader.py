@@ -48,9 +48,14 @@ def apply_hifp8_fake_quant_to_vllm_model(
     It replaces nn.Linear layers with HiFP8FakeQuantizedLinear based on
     the metadata saved during export.
 
+    New architecture (buffer-based):
+    - Scales are embedded in model.safetensors as buffers
+    - Load full state_dict to extract scale tensors
+    - No separate scale files needed
+
     Args:
         model: vLLM model (already loaded with BF16 weights).
-        model_dir: Directory containing hifp8_metadata.json and hifp8_scales/.
+        model_dir: Directory containing hifp8_metadata.json and model.safetensors.
 
     Returns:
         Model with HiFP8FakeQuantizedLinear layers (modified in-place).
@@ -64,6 +69,10 @@ def apply_hifp8_fake_quant_to_vllm_model(
         return model
 
     print(f"[HiFP8 Loader] Loading HiFP8 quantization for {len(layer_metadata)} layers")
+
+    # Load full state_dict to extract scale buffers
+    print("[HiFP8 Loader] Loading state_dict to extract scale buffers...")
+    state_dict = _load_state_dict_from_dir(model_dir)
 
     # Replace each layer
     replacements = []
@@ -91,11 +100,6 @@ def apply_hifp8_fake_quant_to_vllm_model(
                 mode=QuantMode(layer_info["weight_mode"]),
             )
 
-            # Load static weight scale
-            if layer_info.get("weight_scale"):
-                scale_path = model_dir / layer_info["weight_scale"]
-                weight_config.static_scale = torch.load(scale_path, weights_only=True)
-
         # Activation config
         if "activation_dtype" in layer_info:
             activation_config = HiFP8FakeQuantizeConfig(
@@ -104,11 +108,6 @@ def apply_hifp8_fake_quant_to_vllm_model(
                 mode=QuantMode(layer_info["activation_mode"]),
             )
 
-            # Load static activation scale
-            if layer_info.get("activation_scale"):
-                scale_path = model_dir / layer_info["activation_scale"]
-                activation_config.static_scale = torch.load(scale_path, weights_only=True)
-
         # Convert to HiFP8FakeQuantizedLinear
         new_linear = HiFP8FakeQuantizedLinear.from_linear(
             module,
@@ -116,11 +115,33 @@ def apply_hifp8_fake_quant_to_vllm_model(
             weight_config=weight_config,
         )
 
-        # Load smooth_scale
-        if layer_info.get("smooth_scale"):
-            scale_path = model_dir / layer_info["smooth_scale"]
-            smooth_scale = torch.load(scale_path, weights_only=True)
-            new_linear.smooth_scale = smooth_scale.to(new_linear.weight.device)
+        # Load scale buffers from state_dict (new buffer-based architecture)
+        # Smooth scale
+        if layer_info.get("has_smooth_scale"):
+            smooth_scale_key = f"{name}.smooth_scale"
+            if smooth_scale_key in state_dict:
+                smooth_scale = state_dict[smooth_scale_key].to(new_linear.weight.device)
+                new_linear.set_smooth_scale(smooth_scale)
+            else:
+                print(f"[HiFP8 Loader] Warning: {smooth_scale_key} not found in state_dict")
+
+        # Weight static scale
+        if layer_info.get("has_weight_static_scale"):
+            weight_scale_key = f"{name}.weight_static_scale"
+            if weight_scale_key in state_dict:
+                weight_scale = state_dict[weight_scale_key].to(new_linear.weight.device)
+                new_linear.set_static_scales(weight_scale=weight_scale)
+            else:
+                print(f"[HiFP8 Loader] Warning: {weight_scale_key} not found in state_dict")
+
+        # Activation static scale
+        if layer_info.get("has_activation_static_scale"):
+            activation_scale_key = f"{name}.activation_static_scale"
+            if activation_scale_key in state_dict:
+                activation_scale = state_dict[activation_scale_key].to(new_linear.weight.device)
+                new_linear.set_static_scales(activation_scale=activation_scale)
+            else:
+                print(f"[HiFP8 Loader] Warning: {activation_scale_key} not found in state_dict")
 
         replacements.append((name, new_linear))
 
@@ -189,3 +210,79 @@ def _str_to_dtype(dtype_str: str) -> torch.dtype:
     if dtype_str not in dtype_map:
         raise ValueError(f"Unknown dtype string: {dtype_str}")
     return dtype_map[dtype_str]
+
+
+def _load_state_dict_from_dir(model_dir: Path) -> dict:
+    """
+    Load state_dict from model directory.
+
+    Supports both safetensors and pytorch formats.
+
+    Args:
+        model_dir: Directory containing model files.
+
+    Returns:
+        State dict with all tensors (weights + buffers).
+    """
+    # Try safetensors first (preferred format)
+    safetensors_path = model_dir / "model.safetensors"
+    if safetensors_path.exists():
+        try:
+            from safetensors.torch import load_file
+            return load_file(str(safetensors_path))
+        except ImportError:
+            print("[HiFP8 Loader] Warning: safetensors not installed, trying pytorch format")
+
+    # Try sharded safetensors
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            from safetensors.torch import load_file
+            import json
+
+            with open(index_path, 'r') as f:
+                index = json.load(f)
+
+            state_dict = {}
+            weight_map = index.get("weight_map", {})
+
+            # Load all shard files
+            shard_files = set(weight_map.values())
+            for shard_file in shard_files:
+                shard_path = model_dir / shard_file
+                shard_dict = load_file(str(shard_path))
+                state_dict.update(shard_dict)
+
+            return state_dict
+        except ImportError:
+            print("[HiFP8 Loader] Warning: safetensors not installed")
+
+    # Fallback to pytorch format
+    pytorch_path = model_dir / "pytorch_model.bin"
+    if pytorch_path.exists():
+        return torch.load(pytorch_path, map_location="cpu", weights_only=True)
+
+    # Try sharded pytorch format
+    pytorch_index_path = model_dir / "pytorch_model.bin.index.json"
+    if pytorch_index_path.exists():
+        import json
+
+        with open(pytorch_index_path, 'r') as f:
+            index = json.load(f)
+
+        state_dict = {}
+        weight_map = index.get("weight_map", {})
+
+        # Load all shard files
+        shard_files = set(weight_map.values())
+        for shard_file in shard_files:
+            shard_path = model_dir / shard_file
+            shard_dict = torch.load(shard_path, map_location="cpu", weights_only=True)
+            state_dict.update(shard_dict)
+
+        return state_dict
+
+    raise FileNotFoundError(
+        f"No model file found in {model_dir}. "
+        f"Expected one of: model.safetensors, pytorch_model.bin"
+    )
