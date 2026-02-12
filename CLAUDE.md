@@ -213,3 +213,8 @@ All tests require CUDA and are skipped if unavailable (via `@_requires_cuda` dec
 3. **Changing export format**: Modify `export/vllm_export.py` while maintaining `Float8Tensor` as output format.
 
 4. **After any changes**: Run full test suite to ensure no regressions.
+
+## Commit Request
+
+1. Do not add claude as co-author in commit messages
+

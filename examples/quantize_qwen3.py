@@ -273,14 +273,14 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="/root/model/Qwen3-0.6B",
+        default="/home/models/Qwen3-0.6B",
         help="Path to Qwen3 model (local or HuggingFace ID)",
     )
     parser.add_argument(
         "--mode",
         type=str,
         choices=["weight_only", "w8a8"],
-        default="weight_only",
+        default="w8a8",
         help="Quantization mode",
     )
     parser.add_argument(

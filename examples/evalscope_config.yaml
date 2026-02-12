@@ -1,0 +1,42 @@
+# Evalscope Configuration for HiFP8 Fake-Quantized Models
+#
+# Usage:
+#   1. Start API server: python scripts/start_vllm_hifp8_server.py --model /path/to/model --port 8000
+#   2. Run evaluation: evalscope eval --config evalscope_config.yaml
+
+eval:
+  # Model name (must match --model-name from server)
+  model: qwen3-0.6b-hifp8
+
+  # API configuration
+  model_args:
+    api_base: http://localhost:8000/v1
+    api_key: "EMPTY"  # Our server doesn't require API key
+    timeout: 60  # Request timeout in seconds
+
+  # Datasets to evaluate
+  datasets:
+    - mmlu  # Massive Multitask Language Understanding
+    - ceval  # Chinese Evaluation Benchmark
+    - gsm8k  # Grade School Math
+
+  # Evaluation settings
+  batch_size: 1
+  num_fewshot: 5  # Number of few-shot examples
+
+  # Output settings
+  output_dir: ./evalscope_results
+  log_samples: true  # Log individual samples for debugging
+
+# Alternative configuration for large MoE model
+# eval:
+#   model: qwen3-30b-a3b-hifp8
+#   model_args:
+#     api_base: http://localhost:8000/v1
+#     api_key: "EMPTY"
+#   datasets:
+#     - mmlu
+#     - ceval
+#   batch_size: 1
+#   num_fewshot: 5
+#   output_dir: ./evalscope_results_moe

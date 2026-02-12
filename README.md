@@ -9,6 +9,8 @@
 - ✅ **vLLM 兼容**：复用 torchao 的 `Float8Tensor`，支持 weight-only 和 w8a8 模式
 - ✅ **标准 API 集成**：支持 torchao 的 `quantize_()` API
 - ✅ **清晰代码结构**：4 层架构，职责分明
+- ✅ **Evalscope 集成**：OpenAI 兼容 API 服务器，支持标准评估流程
+- ✅ **MoE 支持**：经过验证支持 Qwen3-30B-A3B 等 MoE 架构
 
 ## 目录结构
 
@@ -103,6 +105,104 @@ python examples/quantize_model.py --model facebook/opt-125m --mode w8a8 --output
 ```bash
 python -m unittest tests.test_hifp8_flow -v
 ```
+
+### 6. Evalscope 评估 (新增!)
+
+使用 OpenAI 兼容 API 服务器进行评估：
+
+```bash
+# 1. 导出量化模型
+python examples/quantize_qwen3.py
+
+# 2. 启动 API 服务器
+python scripts/start_vllm_hifp8_server.py \
+    --model /home/data/quantized_qwen3_0.6b \
+    --port 8000 \
+    --model-name qwen3-hifp8
+
+# 3. 使用 evalscope 评估
+evalscope eval \
+    --model qwen3-hifp8 \
+    --api-base http://localhost:8000/v1 \
+    --datasets mmlu ceval gsm8k \
+    --num-fewshot 5
+
+# 或使用自动化脚本（一键完成以上步骤）
+./scripts/run_evalscope_evaluation.sh /home/data/quantized_qwen3_0.6b
+```
+
+**完整文档**: 参见 `docs/evalscope_integration.md`
+
+## vLLM API 服务器
+
+提供 OpenAI 兼容的 API 服务器，用于伪量化模型的推理和评估。
+
+### 启动服务器
+
+```bash
+python scripts/start_vllm_hifp8_server.py \
+    --model /home/data/quantized_qwen3_0.6b \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --model-name qwen3-hifp8
+```
+
+### API 端点
+
+- `GET /v1/models` - 列出可用模型
+- `POST /v1/chat/completions` - 聊天补全（OpenAI 兼容）
+- `POST /v1/completions` - 文本补全（OpenAI 兼容）
+- `GET /health` - 健康检查
+
+### 使用示例
+
+```bash
+# 测试模型列表
+curl http://localhost:8000/v1/models
+
+# 文本补全
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-hifp8",
+    "prompt": "The capital of France is",
+    "max_tokens": 50,
+    "temperature": 0.7
+  }'
+
+# 聊天补全
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-hifp8",
+    "messages": [
+      {"role": "user", "content": "What is machine learning?"}
+    ],
+    "max_tokens": 100
+  }'
+```
+
+### 集成 Evalscope
+
+```bash
+# 自动化评估脚本（推荐）
+./scripts/run_evalscope_evaluation.sh \
+    /home/data/quantized_qwen3_0.6b \
+    8000 \
+    qwen3-hifp8
+
+# 手动评估
+evalscope eval \
+    --model qwen3-hifp8 \
+    --api-base http://localhost:8000/v1 \
+    --datasets mmlu ceval gsm8k \
+    --num-fewshot 5
+```
+
+**详细文档**：
+- API 服务器使用: `scripts/README.md`
+- Evalscope 集成指南: `docs/evalscope_integration.md`
+- vLLM 插件说明: `vllm_plugin/README.md`
 
 ## 核心设计
 
