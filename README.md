@@ -108,30 +108,39 @@ python -m unittest tests.test_hifp8_flow -v
 
 ### 6. Evalscope 评估 (新增!)
 
-使用 OpenAI 兼容 API 服务器进行评估：
+**推荐使用 v2 服务器**（使用官方 vLLM OpenAI API，支持所有功能）：
 
 ```bash
 # 1. 导出量化模型
 python examples/quantize_qwen3.py
 
-# 2. 启动 API 服务器
-python scripts/start_vllm_hifp8_server.py \
+# 2. 启动 vLLM API 服务器 v2
+python scripts/start_vllm_hifp8_server_v2.py \
     --model /home/data/quantized_qwen3_0.6b \
-    --port 8000 \
-    --model-name qwen3-hifp8
+    --reasoning-parser qwen3 \
+    --port 8000
 
 # 3. 使用 evalscope 评估
 evalscope eval \
-    --model qwen3-hifp8 \
+    --model qwen3 \
     --api-base http://localhost:8000/v1 \
-    --datasets mmlu ceval gsm8k \
+    --datasets arc_challenge ceval \
     --num-fewshot 5
 
-# 或使用自动化脚本（一键完成以上步骤）
-./scripts/run_evalscope_evaluation.sh /home/data/quantized_qwen3_0.6b
+# 4. 验证精度（可选）
+python scripts/validate_vllm_accuracy.py \
+    --baseline-url http://localhost:8000 \
+    --hifp8-url http://localhost:8001 \
+    --num-samples 50
 ```
 
-**完整文档**: 参见 `docs/evalscope_integration.md`
+**v2 vs v1 对比**：
+- ✅ v2: 使用官方 vLLM server（80 行代码），支持 streaming、enable_thinking、reasoning_parser
+- ⚠️ v1: 自建 FastAPI server（265 行代码），功能有限
+
+**完整文档**:
+- v2 使用指南: `docs/vllm_server_v2_usage.md` (推荐)
+- evalscope 集成: `docs/evalscope_integration.md`
 
 ## vLLM API 服务器
 

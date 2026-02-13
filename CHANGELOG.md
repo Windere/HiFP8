@@ -4,6 +4,67 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added - vLLM Server v2 (Major Improvement)
+
+**Issue**: Custom FastAPI server (`start_vllm_hifp8_server.py`) was error-prone, missing features, and hard to maintain.
+
+**Problems**:
+- Missing: `enable_thinking`, `reasoning_parser`, streaming, batching
+- 265 lines of custom code reimplementing OpenAI API
+- Difficult to verify accuracy against official vLLM
+- Already had chat template bug - more likely as vLLM evolves
+
+**Solution**: New v2 server using monkey-patch approach
+
+**Implementation**:
+- Monkey-patch vLLM's `DefaultModelLoader.load_model()` to inject HiFP8 quantization
+- Start official vLLM OpenAI server with modified model
+- Transparent to vLLM - it sees HiFP8FakeQuantizedLinear layers as normal modules
+
+**Files Created**:
+- `scripts/start_vllm_hifp8_server_v2.py` (~80 lines, replaces 265-line v1)
+- `scripts/validate_vllm_accuracy.py` (accuracy validation tool)
+- `docs/vllm_server_v2_usage.md` (comprehensive usage guide)
+- `docs/testing_v2_server.md` (testing procedures)
+
+**Files Modified**:
+- `vllm_plugin/hifp8_loader.py`: Added idempotency check
+- `README.md`: Updated with v2 server instructions
+
+**Benefits**:
+- ✅ **70% simpler**: 80 lines vs 265 lines
+- ✅ **All vLLM features**: Streaming, batching, PagedAttention, enable_thinking, reasoning_parser
+- ✅ **Easy verification**: Compare directly with `vllm serve`
+- ✅ **Future-proof**: Benefits from vLLM improvements automatically
+- ✅ **Lower maintenance**: Minimal glue code
+
+**Usage**:
+```bash
+# Old way (v1 - deprecated)
+python scripts/start_vllm_hifp8_server.py --model /path/to/model --port 8000
+
+# New way (v2 - recommended)
+python scripts/start_vllm_hifp8_server_v2.py \
+    --model /path/to/model \
+    --reasoning-parser qwen3 \
+    --port 8000
+```
+
+**Validation**:
+```bash
+python scripts/validate_vllm_accuracy.py \
+    --baseline-url http://localhost:8000 \
+    --hifp8-url http://localhost:8001 \
+    --num-samples 50
+```
+
+**Deprecation Path**:
+- v1 server will be kept for 1 release cycle
+- v2 server is now recommended for all use cases
+- Documentation updated to use v2
+
+---
+
 ### Fixed - Chat Template Support (Critical)
 
 **Issue**: API server used simple string concatenation for chat messages, causing severe quality degradation.

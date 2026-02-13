@@ -53,6 +53,8 @@ def apply_hifp8_fake_quant_to_vllm_model(
     - Load full state_dict to extract scale tensors
     - No separate scale files needed
 
+    Idempotent: Safe to call multiple times - will skip if already quantized.
+
     Args:
         model: vLLM model (already loaded with BF16 weights).
         model_dir: Directory containing hifp8_metadata.json and model.safetensors.
@@ -60,6 +62,17 @@ def apply_hifp8_fake_quant_to_vllm_model(
     Returns:
         Model with HiFP8FakeQuantizedLinear layers (modified in-place).
     """
+    # Check if already applied (idempotent)
+    num_already_quantized = sum(
+        1 for m in model.modules()
+        if isinstance(m, HiFP8FakeQuantizedLinear)
+    )
+
+    if num_already_quantized > 0:
+        print(f"[HiFP8 Loader] Model already has {num_already_quantized} "
+              f"quantized layers, skipping re-quantization")
+        return model
+
     model_dir = Path(model_dir)
     metadata = load_hifp8_metadata(str(model_dir))
 
