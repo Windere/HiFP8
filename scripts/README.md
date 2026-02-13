@@ -14,6 +14,15 @@ Start an OpenAI-compatible API server with HiFP8 fake quantization.
 - Serve OpenAI-compatible API endpoints
 - Enable evalscope and other OpenAI API clients
 
+**⚠️ Important - Chat Template Fix (v2)**:
+The server now correctly uses `tokenizer.apply_chat_template()` instead of simple string concatenation. This is **critical** for model quality:
+- ✅ Qwen3 uses ChatML format with `<|im_start|>`/`<|im_end|>` tokens
+- ✅ Proper formatting significantly improves instruction following
+- ✅ Benchmark accuracy matches official Qwen3 API behavior
+- ❌ Old version used simple "User: ...\nAssistant:" (wrong!)
+
+See `docs/chat_template_fix.md` for technical details.
+
 **Usage:**
 ```bash
 python scripts/start_vllm_hifp8_server.py \

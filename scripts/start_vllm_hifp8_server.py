@@ -125,16 +125,29 @@ def start_server(args):
     async def chat_completions(request: ChatCompletionRequest):
         """Chat completion endpoint (OpenAI compatible)."""
         try:
-            # Convert messages to prompt
-            prompt = ""
-            for msg in request.messages:
-                if msg.role == "system":
-                    prompt += f"System: {msg.content}\n"
-                elif msg.role == "user":
-                    prompt += f"User: {msg.content}\n"
-                elif msg.role == "assistant":
-                    prompt += f"Assistant: {msg.content}\n"
-            prompt += "Assistant:"
+            # Convert messages to proper format using chat template
+            # This is CRITICAL for model performance - each model has its own chat format
+            messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+
+            # Use tokenizer's chat template (e.g., ChatML for Qwen3)
+            # This ensures proper formatting with special tokens like <|im_start|>, <|im_end|>
+            if hasattr(app.state.tokenizer, 'apply_chat_template'):
+                prompt = app.state.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+            else:
+                # Fallback for models without chat template
+                prompt = ""
+                for msg in messages:
+                    if msg["role"] == "system":
+                        prompt += f"System: {msg['content']}\n"
+                    elif msg["role"] == "user":
+                        prompt += f"User: {msg['content']}\n"
+                    elif msg["role"] == "assistant":
+                        prompt += f"Assistant: {msg['content']}\n"
+                prompt += "Assistant:"
 
             # Generate
             inputs = app.state.tokenizer(prompt, return_tensors="pt").to(model.device)

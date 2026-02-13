@@ -8,6 +8,27 @@ This guide shows how to evaluate HiFP8 fake-quantized models using evalscope via
 2. Start the custom vLLM API server with HiFP8 fake quantization
 3. Use evalscope to evaluate via API endpoints
 
+## Important: Chat Template Support
+
+**Critical Fix (v2)**: The API server now correctly uses `tokenizer.apply_chat_template()` instead of simple string concatenation.
+
+**Why this matters**:
+- Qwen3 uses ChatML format with `<|im_start|>` and `<|im_end|>` special tokens
+- Simple concatenation (e.g., "User: ...\nAssistant:") causes significant quality degradation
+- Correct chat template ensures proper model behavior and instruction following
+
+**Verification**:
+```bash
+# Run chat template verification test
+python test_chat_template.py
+```
+
+This test shows:
+- ❌ Wrong format: `"User: {content}\nAssistant:"` (19 tokens)
+- ✅ Correct format: `"<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"` (26 tokens)
+
+The server automatically detects and uses the tokenizer's chat template if available, with fallback for models without chat templates.
+
 ## Step 1: Export Model
 
 First, quantize and export your model:
