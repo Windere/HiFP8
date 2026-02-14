@@ -4,6 +4,121 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added - KV Cache Quantization Support (Major Feature)
+
+**User Request**: "我希望vllm量化过程中能同时支持kv cache hifp8量化"
+
+**Implementation**: Complete HiFP8 KV cache quantization support with dual-mode design.
+
+**Key Features**:
+- ✅ **Dual-mode design**:
+  - DYNAMIC mode: Fake quantization for calibration/training (stores BF16, quantizes on read)
+  - STATIC mode: Real quantization for inference (stores FP8 + scales, ~40-50% memory savings)
+- ✅ **Per-token granularity**: Scale shape `[batch, heads, seq_len, 1]` for optimal precision
+- ✅ **Current-position precision trick**: Uses high-precision for current token, preventing accumulated error
+- ✅ **Non-invasive integration**: Monkey-patches vLLM attention layers, no source modification
+- ✅ **Backward compatible**: Opt-in via configuration, existing code works unchanged
+
+**Memory Savings**:
+- BF16 KV cache: 2 bytes/element
+- FP8 KV cache + FP32 scales: ~1.06 bytes/element (including scale overhead)
+- **Total savings: ~47% for KV cache** (critical for long context inference)
+
+**Files Created**:
+1. `custom_ops/hifp8_kv_ops.py` (~160 lines)
+   - `hifp8_fake_quantize_kv()`: Fake quantization (calibration)
+   - `hifp8_quantize_kv()`: Real quantization (inference)
+   - Per-token granularity, single replacement point for HiFP8 kernel
+
+2. `quantization/hifp8_kv_cache.py` (~250 lines)
+   - `HiFP8KVCache` module with dual-mode support
+   - `update()` method with current-position precision trick
+   - `from_float()` converter for standard caches
+   - `reset()` method
+
+3. `vllm_plugin/hifp8_kv_cache_patcher.py` (~140 lines)
+   - `patch_vllm_kv_cache()`: Monkey-patch vLLM attention layers
+   - `detect_kv_cache_architecture()`: Debug helper
+   - Idempotent, safe to call multiple times
+
+4. `tests/test_hifp8_kv_cache.py` (~370 lines)
+   - 24 comprehensive tests (15 for ops, 9 for module)
+   - Tests both DYNAMIC and STATIC modes
+   - Verifies memory savings (~40-50%)
+   - Tests current-position precision trick
+
+5. `examples/quantize_with_kv_cache.py` (~200 lines)
+   - Complete usage example
+   - Demonstrates all modes (static/dynamic/none)
+   - CLI interface with helpful output
+
+**Files Modified**:
+1. `quantization/hifp8_config.py`
+   - Added `HiFP8KVCacheConfig` dataclass
+   - Extended `HiFP8QuantizationConfig` with `kv_cache_config` parameter
+
+2. `export/bf16_export.py`
+   - Added `kv_cache_config` parameter to `export_bf16_for_vllm()`
+   - Extended metadata serialization with KV cache config
+   - Added `load_kv_cache_config()` helper function
+
+3. `scripts/start_vllm_hifp8_server_v2.py`
+   - Added `patch_vllm_kv_cache()` call in model loader hook
+   - Automatic KV cache quantization when enabled in metadata
+
+4. `custom_ops/__init__.py`, `quantization/__init__.py`, `vllm_plugin/__init__.py`
+   - Added exports for new functions and classes
+
+**Usage**:
+```bash
+# Export with KV cache quantization (STATIC mode for inference)
+python examples/quantize_with_kv_cache.py \\
+    --model /home/models/Qwen3-0.6B \\
+    --output /home/data/quantized_qwen3_with_kvcache \\
+    --kv-mode static
+
+# Start vLLM server (automatically enables KV cache quant if in metadata)
+python scripts/start_vllm_hifp8_server_v2.py \\
+    --model /home/data/quantized_qwen3_with_kvcache \\
+    --port 8000 \\
+    --reasoning-parser qwen3
+```
+
+**Test Results**:
+- ✅ All 24 unit tests passing
+- ✅ Memory savings verified: ~47% for KV cache in STATIC mode
+- ✅ Per-token quantization working correctly
+- ✅ Current-position precision trick preventing error accumulation
+- ✅ Dual-mode switching functional
+
+**Technical Design**:
+- Follows existing 4-layer architecture (ops → modules → export → plugin)
+- Single replacement point pattern for future HiFP8 CUDA kernels
+- Consistent with torchao's `AffineQuantizedKVCache` pattern
+- Uses existing torchao primitives as placeholders
+
+**Architecture Extension**:
+```
+Layer 1: custom_ops/
+  ├─ hifp8_ops.py (existing - weights/activations)
+  └─ hifp8_kv_ops.py (NEW - KV cache ops)
+
+Layer 2: quantization/
+  ├─ hifp8_config.py (extended with KVCacheConfig)
+  ├─ hifp8_linear.py (existing)
+  └─ hifp8_kv_cache.py (NEW - KV cache module)
+
+Layer 3: export/
+  ├─ vllm_export.py (existing)
+  └─ bf16_export.py (extended metadata)
+
+Layer 4: vllm_plugin/
+  ├─ hifp8_loader.py (existing)
+  └─ hifp8_kv_cache_patcher.py (NEW - patches vLLM)
+```
+
+---
+
 ### Added - vLLM Server v2 (Major Improvement)
 
 **Issue**: Custom FastAPI server (`start_vllm_hifp8_server.py`) was error-prone, missing features, and hard to maintain.

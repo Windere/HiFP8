@@ -1,6 +1,7 @@
 from .hifp8_config import (
     HiFP8FakeQuantizeConfig,
     HiFP8QuantizationConfig,
+    HiFP8KVCacheConfig,
     QuantMode,
 )
 from .hifp8_fake_quantizer import HiFP8FakeQuantizer
@@ -18,10 +19,12 @@ from .calibration import (
     HiFP8ActivationObserver,
     calibrate_model,
 )
+from .hifp8_kv_cache import HiFP8KVCache
 
 __all__ = [
     "HiFP8FakeQuantizeConfig",
     "HiFP8QuantizationConfig",
+    "HiFP8KVCacheConfig",
     "QuantMode",
     "HiFP8FakeQuantizer",
     "HiFP8FakeQuantizedLinear",
@@ -32,4 +35,5 @@ __all__ = [
     "calibrate_and_smooth",
     "HiFP8ActivationObserver",
     "calibrate_model",
+    "HiFP8KVCache",
 ]

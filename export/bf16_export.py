@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 
 from quantization.hifp8_linear import HiFP8FakeQuantizedLinear
-from quantization.hifp8_config import QuantMode
+from quantization.hifp8_config import QuantMode, HiFP8KVCacheConfig
 
 
 def export_bf16_for_vllm(
@@ -24,6 +24,7 @@ def export_bf16_for_vllm(
     tokenizer,
     output_dir: str,
     config_dict: Optional[dict] = None,
+    kv_cache_config: Optional[HiFP8KVCacheConfig] = None,
 ):
     """
     Export HiFP8 model as BF16 format with scales embedded as buffers.
@@ -45,6 +46,7 @@ def export_bf16_for_vllm(
         tokenizer: HuggingFace tokenizer.
         output_dir: Output directory path.
         config_dict: Optional dict with additional metadata (e.g., smooth_alpha).
+        kv_cache_config: Optional KV cache quantization configuration.
 
     Returns:
         Path to output directory as string.
@@ -101,6 +103,20 @@ def export_bf16_for_vllm(
         "export_format": "bf16_with_buffers",
         "layers": layer_metadata,
     }
+
+    # Add KV cache configuration if provided
+    if kv_cache_config and kv_cache_config.enabled:
+        metadata["kv_cache_config"] = {
+            "enabled": kv_cache_config.enabled,
+            "target_dtype": str(kv_cache_config.target_dtype),
+            "mode": kv_cache_config.mode.value,
+            "param1": kv_cache_config.param1,
+            "param2": kv_cache_config.param2,
+        }
+        print(f"[BF16 Export] KV cache quantization enabled: mode={kv_cache_config.mode.value}")
+    else:
+        metadata["kv_cache_config"] = None
+
     if config_dict:
         metadata.update(config_dict)
 
@@ -153,3 +169,53 @@ def load_bf16_metadata(metadata_path: str) -> dict:
     """
     with open(metadata_path, "r") as f:
         return json.load(f)
+
+
+def load_kv_cache_config(metadata_or_path) -> Optional[HiFP8KVCacheConfig]:
+    """
+    Load KV cache configuration from metadata.
+
+    Args:
+        metadata_or_path: Either a metadata dict or a path to model directory or metadata file.
+
+    Returns:
+        HiFP8KVCacheConfig if KV cache quantization is enabled, else None.
+    """
+    if isinstance(metadata_or_path, (str, Path)):
+        # Load from path
+        metadata_path = Path(metadata_or_path)
+        if metadata_path.is_dir():
+            metadata_path = metadata_path / "hifp8_metadata.json"
+
+        if not metadata_path.exists():
+            return None
+
+        metadata = load_bf16_metadata(str(metadata_path))
+    else:
+        # Already a dict
+        metadata = metadata_or_path
+
+    kv_config_dict = metadata.get("kv_cache_config")
+    if not kv_config_dict or not kv_config_dict.get("enabled"):
+        return None
+
+    # Parse dtype
+    import torch
+    dtype_str = kv_config_dict.get("target_dtype", "torch.float8_e4m3fn")
+    if dtype_str.startswith("torch."):
+        target_dtype = getattr(torch, dtype_str.split(".")[-1])
+    else:
+        target_dtype = torch.float8_e4m3fn
+
+    # Parse mode
+    from quantization.hifp8_config import QuantMode
+    mode_str = kv_config_dict.get("mode", "dynamic")
+    mode = QuantMode(mode_str)
+
+    return HiFP8KVCacheConfig(
+        enabled=True,
+        target_dtype=target_dtype,
+        mode=mode,
+        param1=kv_config_dict.get("param1", 0),
+        param2=kv_config_dict.get("param2", 0),
+    )

@@ -12,11 +12,12 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            // "args": [
-            //     "--lr", "0.01",
-            //     "--batch_size", "32",
-            //     "--model_name", "resnet"
-            // ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+            },
+            "args": [
+                "--smooth-alpha", "0.5",
+            ],
         }
     ]
 }

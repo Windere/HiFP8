@@ -52,7 +52,7 @@ from vllm.entrypoints.openai.api_server import run_server
 import asyncio
 
 # Import our plugin
-from vllm_plugin import apply_hifp8_fake_quant_to_vllm_model
+from vllm_plugin import apply_hifp8_fake_quant_to_vllm_model, patch_vllm_kv_cache
 
 
 # ==============================================================================
@@ -96,8 +96,14 @@ def _hifp8_patched_load_model(self, *args, **kwargs):
             print("=" * 80)
 
             try:
+                # Apply Linear layer quantization
                 apply_hifp8_fake_quant_to_vllm_model(model, model_path)
-                print("[HiFP8] ✓ Fake quantization applied successfully")
+                print("[HiFP8] ✓ Linear layer fake quantization applied successfully")
+
+                # Apply KV cache quantization (if enabled in metadata)
+                patch_vllm_kv_cache(model, model_path)
+                print("[HiFP8] ✓ KV cache patching completed")
+
             except Exception as e:
                 print(f"[HiFP8] ✗ Failed to apply quantization: {e}")
                 raise

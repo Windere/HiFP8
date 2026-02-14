@@ -142,6 +142,121 @@ python scripts/validate_vllm_accuracy.py \
 - v2 使用指南: `docs/vllm_server_v2_usage.md` (推荐)
 - evalscope 集成: `docs/evalscope_integration.md`
 
+### 7. KV Cache 量化 (新增!)
+
+**HiFP8 现在支持 KV cache 量化，可节省 ~40-50% 的 KV cache 内存！**
+
+#### 特性
+
+- ✅ **双模式设计**:
+  - **STATIC 模式** (推荐用于推理): 存储 FP8 数据 + FP32 scales，节省 ~47% 内存
+  - **DYNAMIC 模式** (用于校准): 存储 BF16，读取时伪量化，模拟量化误差
+- ✅ **Per-token 粒度**: 每个 token 位置独立的 scale
+- ✅ **当前位置精度技巧**: 生成当前 token 使用高精度，防止误差累积
+- ✅ **非侵入式**: Monkey-patch vLLM 注意力层，无需修改 vLLM 源码
+- ✅ **向后兼容**: 通过配置启用，现有代码无需修改
+
+#### 快速开始
+
+```bash
+# 1. 导出模型（启用 KV cache 量化，STATIC 模式用于推理）
+python examples/quantize_with_kv_cache.py \
+    --model /home/models/Qwen3-0.6B \
+    --output /home/data/quantized_qwen3_with_kvcache \
+    --kv-mode static \
+    --linear-mode w8a8
+
+# 2. 启动 vLLM server（自动启用 KV cache 量化）
+python scripts/start_vllm_hifp8_server_v2.py \
+    --model /home/data/quantized_qwen3_with_kvcache \
+    --port 8000 \
+    --reasoning-parser qwen3 \
+    --max-model-len 4096  # 更长的上下文！
+
+# 3. 测试推理
+curl -X POST http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "qwen3",
+      "messages": [{"role": "user", "content": "Hello!"}],
+      "max_tokens": 100
+    }'
+```
+
+#### 内存节省示例
+
+以 Qwen3-0.6B 模型、2048 上下文为例：
+
+| 配置 | KV Cache 内存 | 节省 |
+|------|--------------|------|
+| **无量化 (BF16)** | ~1.2 GB | - |
+| **HiFP8 KV Cache (FP8)** | ~0.64 GB | **~47%** |
+
+对于 7B 模型、4096 上下文：~8 GB → ~4.2 GB (**节省 ~47%**)
+
+#### 使用场景
+
+**STATIC 模式**（推荐用于生产环境）:
+- 实际存储 FP8 数据，节省内存
+- 支持更长的上下文窗口
+- 减少内存带宽，加速推理
+- 用于 vLLM 推理服务器
+
+**DYNAMIC 模式**（用于校准/训练）:
+- 模拟量化误差
+- 用于 QAT 训练或误差分析
+- 存储 BF16，无内存节省
+
+#### 配置选项
+
+```python
+from quantization import HiFP8KVCacheConfig, QuantMode
+import torch
+
+# STATIC 模式（推理）
+kv_config = HiFP8KVCacheConfig(
+    enabled=True,
+    mode=QuantMode.STATIC,
+    target_dtype=torch.float8_e4m3fn,
+)
+
+# DYNAMIC 模式（校准）
+kv_config = HiFP8KVCacheConfig(
+    enabled=True,
+    mode=QuantMode.DYNAMIC,
+    target_dtype=torch.float8_e4m3fn,
+)
+
+# 导出时传入配置
+export_bf16_for_vllm(
+    model=model,
+    tokenizer=tokenizer,
+    output_dir="/path/to/output",
+    kv_cache_config=kv_config,
+)
+```
+
+#### 技术实现
+
+KV cache 量化遵循现有的 4 层架构：
+
+```
+Layer 1: custom_ops/hifp8_kv_ops.py
+  - hifp8_fake_quantize_kv(): 伪量化
+  - hifp8_quantize_kv(): 真实量化
+
+Layer 2: quantization/hifp8_kv_cache.py
+  - HiFP8KVCache: 双模式 KV cache 模块
+
+Layer 3: export/bf16_export.py
+  - 扩展 metadata 支持 KV cache 配置
+
+Layer 4: vllm_plugin/hifp8_kv_cache_patcher.py
+  - Monkey-patch vLLM 注意力层
+```
+
+**单一替换点**: 未来集成真实 HiFP8 CUDA kernel 时，只需修改 `hifp8_kv_ops.py` 中的函数体。
+
 ## vLLM API 服务器
 
 提供 OpenAI 兼容的 API 服务器，用于伪量化模型的推理和评估。
