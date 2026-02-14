@@ -47,6 +47,7 @@ print("[HiFP8] Setting up HiFP8 vLLM Server...")
 
 # Import vLLM components
 from vllm.model_executor.model_loader import default_loader
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.entrypoints.openai.cli_args import make_arg_parser
 from vllm.entrypoints.openai.api_server import run_server
 import asyncio
@@ -125,7 +126,8 @@ print("[HiFP8] ✓ Model loader patch installed")
 
 def main():
     """Parse arguments and start vLLM server."""
-    parser = make_arg_parser()
+    parser = FlexibleArgumentParser()
+    parser = make_arg_parser(parser)
     args = parser.parse_args()
 
     print("\n" + "=" * 80)
