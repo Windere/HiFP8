@@ -18,6 +18,74 @@ import torch.nn as nn
 from quantization.hifp8_linear import HiFP8FakeQuantizedLinear
 from quantization.hifp8_config import QuantMode, HiFP8KVCacheConfig
 
+# Import uint8 export (if available)
+try:
+    from .uint8_export import export_uint8_for_vllm
+    HAS_UINT8_EXPORT = True
+except ImportError:
+    HAS_UINT8_EXPORT = False
+
+
+def export_for_vllm(
+    model: nn.Module,
+    tokenizer,
+    output_dir: str,
+    config_dict: Optional[dict] = None,
+    kv_cache_config: Optional[HiFP8KVCacheConfig] = None,
+    export_mode: str = "bf16",
+    param1: int = 0,
+    param2: int = 0,
+):
+    """
+    Export HiFP8 model for vLLM inference.
+
+    This is the main export entry point that delegates to the appropriate
+    export strategy based on export_mode.
+
+    Args:
+        model: Model with HiFP8FakeQuantizedLinear layers.
+        tokenizer: HuggingFace tokenizer.
+        output_dir: Output directory path.
+        config_dict: Optional dict with additional metadata.
+        kv_cache_config: Optional KV cache quantization configuration.
+        export_mode: Export format:
+                     - "bf16": BF16 weights with scales (default)
+                     - "uint8": Real uint8 quantization with HiFloat8 encoding
+                     - "fp8": Float8Tensor format
+        param1: HiFP8 parameter (for uint8 mode)
+        param2: HiFP8 parameter (for uint8 mode)
+
+    Returns:
+        Path to output directory as string.
+    """
+    if export_mode == "uint8":
+        if not HAS_UINT8_EXPORT:
+            raise ImportError(
+                "uint8 export not available. "
+                "Please ensure custom_ops/hifp8_uint8_layout.py is accessible."
+            )
+        return export_uint8_for_vllm(
+            model=model,
+            tokenizer=tokenizer,
+            output_dir=output_dir,
+            config_dict=config_dict,
+            param1=param1,
+            param2=param2,
+        )
+    elif export_mode == "bf16":
+        return export_bf16_for_vllm(
+            model=model,
+            tokenizer=tokenizer,
+            output_dir=output_dir,
+            config_dict=config_dict,
+            kv_cache_config=kv_cache_config,
+        )
+    elif export_mode == "fp8":
+        # TODO: Implement FP8 export (Float8Tensor)
+        raise NotImplementedError("FP8 export mode not yet implemented")
+    else:
+        raise ValueError(f"Unknown export_mode: {export_mode}")
+
 
 def export_bf16_for_vllm(
     model: nn.Module,
@@ -28,6 +96,9 @@ def export_bf16_for_vllm(
 ):
     """
     Export HiFP8 model as BF16 format with scales embedded as buffers.
+
+    Note: This is the internal BF16 export function. Use export_for_vllm()
+    as the main entry point.
 
     New architecture:
     - Scales are already registered as module buffers, automatically included in state_dict

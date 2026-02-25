@@ -254,7 +254,7 @@ def configure_vllm_fp8_kv_cache(model_dir: str) -> Optional[dict]:
     with open(metadata_path, "r") as f:
         metadata = json.load(f)
 
-    kv_config = metadata.get("kv_cache_config", {})
+    kv_config = metadata.get("kv_cache_config") or {}
     if not kv_config.get("enabled", False):
         logger.info(f"[HiFP8] KV cache quantization not enabled in metadata.")
         return None

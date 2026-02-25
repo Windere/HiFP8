@@ -37,6 +37,8 @@ class HiFP8FakeQuantizeConfig:
         param1: Reserved for future HiFP8 CUDA kernel parameter.
         param2: Reserved for future HiFP8 CUDA kernel parameter.
         enabled: Whether fake quantization is active. Default: True.
+        use_uint8_encoding: Whether to use real uint8 encoding (vs FP8 placeholder).
+                           Default: False (use FP8 placeholder).
     """
     granularity: object = field(default_factory=PerRow)
     target_dtype: torch.dtype = torch.float8_e4m3fn
@@ -45,6 +47,7 @@ class HiFP8FakeQuantizeConfig:
     param1: int = 0
     param2: int = 0
     enabled: bool = True
+    use_uint8_encoding: bool = False
 
 
 @dataclass
@@ -87,7 +90,10 @@ class HiFP8QuantizationConfig(AOBaseConfig):
         activation_config: Config for activation fake quantization. None = weight-only.
         kv_cache_config: Config for KV cache quantization. None = no KV cache quant.
         smooth_alpha: SmoothQuant alpha parameter. None = SmoothQuant disabled.
-        export_mode: Export format: "fp8" (Float8Tensor) or "bf16" (BF16 + metadata).
+        export_mode: Export format:
+                     - "fp8": Float8Tensor (standard FP8)
+                     - "bf16": BF16 + metadata
+                     - "uint8": Real uint8 quantization with HiFloat8 encoding
     """
     weight_config: Optional[HiFP8FakeQuantizeConfig] = field(
         default_factory=HiFP8FakeQuantizeConfig
