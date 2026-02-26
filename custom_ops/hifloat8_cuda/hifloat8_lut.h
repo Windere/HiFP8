@@ -49,6 +49,7 @@ __constant__ const float HIF8_DECODE_LUT[HIF8_LUT_SIZE] = {
 // Special index values
 #define HIF8_IDX_ZERO 0
 #define HIF8_IDX_MAX 126
+#define HIF8_IDX_INF 127
 
 // Encoding helper: binary search to find closest value
 // Returns index in [0, HIF8_LUT_SIZE-1]
@@ -84,7 +85,10 @@ __device__ __forceinline__ uint8_t hif8_find_index(float magnitude) {
 
 // Decoding helper: direct lookup
 __device__ __forceinline__ float hif8_lookup_value(uint8_t index) {
-    return HIF8_DECODE_LUT[index & 0x7F];  // Mask to 7 bits
+    uint8_t idx = index & 0x7F;  // Mask to 7 bits
+    if (idx == HIF8_IDX_INF)
+        return __int_as_float(0x7f800000);  // +Inf
+    return HIF8_DECODE_LUT[idx];
 }
 
 #endif // HIFLOAT8_LUT_H

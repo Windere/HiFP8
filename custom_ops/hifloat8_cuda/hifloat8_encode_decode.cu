@@ -15,7 +15,7 @@ __device__ __forceinline__ uint8_t hif8_encode_uint8_device(float x) {
         return 0x00;
 
     if (__isinff(rounded))
-        return (rounded > 0) ? 0x7E : 0xFE;
+        return (rounded > 0) ? 0x7F : 0xFF;
 
     uint8_t sign_bit = (rounded < 0.0f) ? 0x80 : 0x00;
     float magnitude = fabsf(rounded);

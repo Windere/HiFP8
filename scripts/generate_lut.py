@@ -89,6 +89,7 @@ __constant__ const float HIF8_DECODE_LUT[HIF8_LUT_SIZE] = {{
     header += """// Special index values
 #define HIF8_IDX_ZERO 0
 #define HIF8_IDX_MAX {max_idx}
+#define HIF8_IDX_INF 127
 
 // Encoding helper: binary search to find closest value
 // Returns index in [0, HIF8_LUT_SIZE-1]
@@ -124,7 +125,10 @@ __device__ __forceinline__ uint8_t hif8_find_index(float magnitude) {{
 
 // Decoding helper: direct lookup
 __device__ __forceinline__ float hif8_lookup_value(uint8_t index) {{
-    return HIF8_DECODE_LUT[index & 0x7F];  // Mask to 7 bits
+    uint8_t idx = index & 0x7F;  // Mask to 7 bits
+    if (idx == HIF8_IDX_INF)
+        return __int_as_float(0x7f800000);  // +Inf
+    return HIF8_DECODE_LUT[idx];
 }}
 
 #endif // HIFLOAT8_LUT_H
@@ -177,9 +181,11 @@ TEST_VECTORS = [
 # Special value mappings
 SPECIAL_ENCODINGS = {
     'zero': 0x00,
-    'max': 0x7F,
+    'max': 0x7E,      # index 126 = 32768 (largest finite value)
+    'inf': 0x7F,      # index 127 = +Inf
     'neg_zero': 0x80,
-    'neg_max': 0xFF,
+    'neg_max': 0xFE,   # index 126 | sign = -32768
+    'neg_inf': 0xFF,   # index 127 | sign = -Inf
 }
 """
 
