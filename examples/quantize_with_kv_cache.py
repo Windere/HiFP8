@@ -40,7 +40,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from quantization import (
     HiFP8FakeQuantizeConfig,
     HiFP8QuantizationConfig,
-    HiFP8KVCacheConfig,
     QuantMode,
 )
 from torchao.quantization.quant_api import quantize_
@@ -138,7 +137,7 @@ def main():
         print("  - KV cache quantization: Disabled")
     else:
         mode = QuantMode.STATIC if args.kv_mode == "static" else QuantMode.DYNAMIC
-        kv_cache_config = HiFP8KVCacheConfig(
+        kv_cache_config = HiFP8FakeQuantizeConfig(
             enabled=True,
             mode=mode,
             target_dtype=torch.float8_e4m3fn,

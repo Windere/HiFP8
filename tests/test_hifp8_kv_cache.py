@@ -18,7 +18,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from custom_ops.hifp8_kv_ops import hifp8_fake_quantize_kv, hifp8_quantize_kv
-from quantization import HiFP8KVCache, HiFP8KVCacheConfig, QuantMode
+from quantization import HiFP8KVCache, HiFP8FakeQuantizeConfig, QuantMode
 
 
 def _requires_cuda(test_func):
@@ -194,7 +194,7 @@ class TestHiFP8KVCacheModule(unittest.TestCase):
     @_requires_cuda
     def test_dynamic_mode_initialization(self):
         """Test DYNAMIC mode cache initialization."""
-        config = HiFP8KVCacheConfig(enabled=True, mode=QuantMode.DYNAMIC)
+        config = HiFP8FakeQuantizeConfig(enabled=True, mode=QuantMode.DYNAMIC)
         cache = HiFP8KVCache(
             max_batch_size=2,
             max_seq_length=128,
@@ -214,7 +214,7 @@ class TestHiFP8KVCacheModule(unittest.TestCase):
     @_requires_cuda
     def test_static_mode_initialization(self):
         """Test STATIC mode cache initialization."""
-        config = HiFP8KVCacheConfig(enabled=True, mode=QuantMode.STATIC)
+        config = HiFP8FakeQuantizeConfig(enabled=True, mode=QuantMode.STATIC)
         cache = HiFP8KVCache(
             max_batch_size=2,
             max_seq_length=128,
@@ -235,7 +235,7 @@ class TestHiFP8KVCacheModule(unittest.TestCase):
     @_requires_cuda
     def test_dynamic_mode_update(self):
         """Test cache update in DYNAMIC mode."""
-        config = HiFP8KVCacheConfig(enabled=True, mode=QuantMode.DYNAMIC)
+        config = HiFP8FakeQuantizeConfig(enabled=True, mode=QuantMode.DYNAMIC)
         cache = HiFP8KVCache(
             max_batch_size=2,
             max_seq_length=128,
@@ -261,7 +261,7 @@ class TestHiFP8KVCacheModule(unittest.TestCase):
     @_requires_cuda
     def test_static_mode_update(self):
         """Test cache update in STATIC mode."""
-        config = HiFP8KVCacheConfig(enabled=True, mode=QuantMode.STATIC)
+        config = HiFP8FakeQuantizeConfig(enabled=True, mode=QuantMode.STATIC)
         cache = HiFP8KVCache(
             max_batch_size=2,
             max_seq_length=128,
@@ -287,7 +287,7 @@ class TestHiFP8KVCacheModule(unittest.TestCase):
     @_requires_cuda
     def test_multi_step_generation(self):
         """Test cache behavior over multiple generation steps."""
-        config = HiFP8KVCacheConfig(enabled=True, mode=QuantMode.STATIC)
+        config = HiFP8FakeQuantizeConfig(enabled=True, mode=QuantMode.STATIC)
         cache = HiFP8KVCache(
             max_batch_size=1,
             max_seq_length=10,
@@ -311,7 +311,7 @@ class TestHiFP8KVCacheModule(unittest.TestCase):
     @_requires_cuda
     def test_current_position_precision_trick(self):
         """Test that current position uses original precision."""
-        config = HiFP8KVCacheConfig(enabled=True, mode=QuantMode.STATIC)
+        config = HiFP8FakeQuantizeConfig(enabled=True, mode=QuantMode.STATIC)
         cache = HiFP8KVCache(
             max_batch_size=1,
             max_seq_length=10,
@@ -341,8 +341,8 @@ class TestHiFP8KVCacheModule(unittest.TestCase):
     @_requires_cuda
     def test_memory_savings_static_mode(self):
         """Test that STATIC mode uses less memory than DYNAMIC mode."""
-        dynamic_config = HiFP8KVCacheConfig(enabled=True, mode=QuantMode.DYNAMIC)
-        static_config = HiFP8KVCacheConfig(enabled=True, mode=QuantMode.STATIC)
+        dynamic_config = HiFP8FakeQuantizeConfig(enabled=True, mode=QuantMode.DYNAMIC)
+        static_config = HiFP8FakeQuantizeConfig(enabled=True, mode=QuantMode.STATIC)
 
         # Create both caches
         cache_dynamic = HiFP8KVCache(
@@ -382,7 +382,7 @@ class TestHiFP8KVCacheModule(unittest.TestCase):
     @_requires_cuda
     def test_reset(self):
         """Test cache reset functionality."""
-        config = HiFP8KVCacheConfig(enabled=True, mode=QuantMode.STATIC)
+        config = HiFP8FakeQuantizeConfig(enabled=True, mode=QuantMode.STATIC)
         cache = HiFP8KVCache(
             max_batch_size=2,
             max_seq_length=10,
@@ -409,7 +409,7 @@ class TestHiFP8KVCacheModule(unittest.TestCase):
     @_requires_cuda
     def test_batch_dimension(self):
         """Test that different batch elements are handled independently."""
-        config = HiFP8KVCacheConfig(enabled=True, mode=QuantMode.DYNAMIC)
+        config = HiFP8FakeQuantizeConfig(enabled=True, mode=QuantMode.DYNAMIC)
         cache = HiFP8KVCache(
             max_batch_size=4,
             max_seq_length=10,

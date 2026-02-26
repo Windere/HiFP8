@@ -145,6 +145,7 @@ def export_raw_state_dict(
             w_config.param2,
             granularity=w_config.granularity,
             target_dtype=w_config.target_dtype,
+            scale_factor=w_config.scale_factor,
         )
         state_dict[f"{name}.weight.qdata"] = q_data
         state_dict[f"{name}.weight.scale"] = scale

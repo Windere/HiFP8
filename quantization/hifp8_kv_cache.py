@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 
 from custom_ops.hifp8_kv_ops import hifp8_fake_quantize_kv, hifp8_quantize_kv
-from quantization.hifp8_config import HiFP8KVCacheConfig, QuantMode
+from quantization.hifp8_config import HiFP8FakeQuantizeConfig, QuantMode
 
 
 class HiFP8KVCache(nn.Module):
@@ -39,11 +39,11 @@ class HiFP8KVCache(nn.Module):
         max_seq_length: Maximum sequence length.
         n_heads: Number of attention heads.
         head_dim: Dimension of each head.
-        config: HiFP8KVCacheConfig configuration.
+        config: HiFP8FakeQuantizeConfig configuration.
         dtype: Storage dtype for DYNAMIC mode. Default: torch.bfloat16.
 
     Example:
-        >>> config = HiFP8KVCacheConfig(enabled=True, mode=QuantMode.STATIC)
+        >>> config = HiFP8FakeQuantizeConfig(enabled=True, mode=QuantMode.STATIC)
         >>> kv_cache = HiFP8KVCache(
         ...     max_batch_size=4,
         ...     max_seq_length=2048,
@@ -65,7 +65,7 @@ class HiFP8KVCache(nn.Module):
         max_seq_length: int,
         n_heads: int,
         head_dim: int,
-        config: HiFP8KVCacheConfig,
+        config: HiFP8FakeQuantizeConfig,
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
@@ -214,14 +214,14 @@ class HiFP8KVCache(nn.Module):
     @staticmethod
     def from_float(
         float_cache: nn.Module,
-        config: HiFP8KVCacheConfig,
+        config: HiFP8FakeQuantizeConfig,
     ) -> "HiFP8KVCache":
         """
         Convert a standard KV cache to HiFP8KVCache.
 
         Args:
             float_cache: Standard KV cache module (expected to have k_cache, v_cache buffers).
-            config: HiFP8KVCacheConfig.
+            config: HiFP8FakeQuantizeConfig.
 
         Returns:
             HiFP8KVCache with same dimensions and device placement.

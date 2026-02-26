@@ -64,18 +64,21 @@ def export_uint8_for_vllm(
     total_uint8_bytes = 0
 
     # Collect all parameter names that belong to Linear layers
-    linear_weight_names = set()
+    # Maps weight param name -> scale_factor from config
+    linear_weight_info = {}
     for name, module in model.named_modules():
         if isinstance(module, HiFP8FakeQuantizedLinear):
-            # HiFP8FakeQuantizedLinear has children (fake quantizers) but still has .weight
-            linear_weight_names.add(f"{name}.weight")
+            sf = 1.0
+            if module.weight_fake_quantizer is not None:
+                sf = module.weight_fake_quantizer.config.scale_factor
+            linear_weight_info[f"{name}.weight"] = sf
         elif isinstance(module, nn.Linear):
             if len(list(module.children())) == 0:  # leaf module
-                linear_weight_names.add(f"{name}.weight")
+                linear_weight_info[f"{name}.weight"] = 1.0
 
     # Process all parameters
     for param_name, param in model.named_parameters():
-        if param_name in linear_weight_names:
+        if param_name in linear_weight_info:
             # Encode this Linear weight to uint8
             w = param.data
             device = w.device
@@ -84,7 +87,8 @@ def export_uint8_for_vllm(
 
             # Move to CUDA for encoding, then back to CPU for saving
             w_f32 = w.float().cuda()
-            uint8_data, scale = hifp8_encode_uint8(w_f32)
+            sf = linear_weight_info[param_name]
+            uint8_data, scale = hifp8_encode_uint8(w_f32, scale_factor=sf)
 
             uint8_key = param_name.replace(".weight", ".weight_uint8")
             scale_key = param_name.replace(".weight", ".weight_scale")

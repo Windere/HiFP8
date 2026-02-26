@@ -67,10 +67,14 @@ class TestHiFP8Ops(unittest.TestCase):
         self.assertEqual(out.dtype, x.dtype)
 
     @_requires_cuda
-    def test_quantize_weight_returns_fp8_and_scale(self):
+    def test_quantize_weight_returns_quantized_and_scale(self):
+        from custom_ops.hifp8_ops import get_backend
         w = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
         q_data, scale = hifp8_quantize_weight(w, 0, 0)
-        self.assertEqual(q_data.dtype, torch.float8_e4m3fn)
+        if get_backend() == "hifp8":
+            self.assertEqual(q_data.dtype, torch.uint8)
+        else:
+            self.assertEqual(q_data.dtype, torch.float8_e4m3fn)
         self.assertEqual(q_data.shape, w.shape)
         # Per-row scale: one scale per row
         self.assertEqual(scale.shape[0], w.shape[0])
@@ -108,7 +112,7 @@ class TestHiFP8FakeQuantizer(unittest.TestCase):
         fq = HiFP8FakeQuantizer(config).cuda()
 
         # Swap to identity function
-        def identity_fn(x, p1, p2, *, granularity=None, target_dtype=None, static_scale=None):
+        def identity_fn(x, p1, p2, *, granularity=None, target_dtype=None, static_scale=None, scale_factor=1.0):
             return x
 
         fq.set_quantize_fn(identity_fn)
@@ -305,7 +309,11 @@ class TestExport(unittest.TestCase):
         self.assertIn("0.weight.qdata", state_dict)
         self.assertIn("0.weight.scale", state_dict)
         self.assertIn("0.bias", state_dict)
-        self.assertEqual(state_dict["0.weight.qdata"].dtype, torch.float8_e4m3fn)
+        from custom_ops.hifp8_ops import get_backend
+        if get_backend() == "hifp8":
+            self.assertEqual(state_dict["0.weight.qdata"].dtype, torch.uint8)
+        else:
+            self.assertEqual(state_dict["0.weight.qdata"].dtype, torch.float8_e4m3fn)
 
         os.unlink(f.name)
 
@@ -360,7 +368,6 @@ class TestStaticQuantization(unittest.TestCase):
 
         config = HiFP8FakeQuantizeConfig(
             mode=QuantMode.STATIC,
-            static_scale=static_scale,
             granularity=PerRow(),
         )
 
@@ -371,10 +378,54 @@ class TestStaticQuantization(unittest.TestCase):
             device="cuda", dtype=torch.bfloat16,
         )
 
+        # Set static scale on the quantizer (per-layer, not on shared config)
+        fq_linear.activation_fake_quantizer.set_static_scale(static_scale)
+
         # Use single batch to match scale shape
         x = torch.randn(1, 64, device="cuda", dtype=torch.bfloat16)
         out = fq_linear(x)
         self.assertEqual(out.shape, (1, 128))
+
+
+    @_requires_cuda
+    def test_static_scale_per_layer_isolation(self):
+        """Verify that layers sharing config get independent static scales."""
+        from quantization.hifp8_config import QuantMode
+
+        # Two layers share the SAME config object (as quantize_() does)
+        shared_config = HiFP8FakeQuantizeConfig(mode=QuantMode.STATIC)
+
+        layer_a = HiFP8FakeQuantizedLinear(
+            32, 64, bias=False,
+            activation_config=shared_config,
+            weight_config=HiFP8FakeQuantizeConfig(),
+            device="cuda", dtype=torch.bfloat16,
+        )
+        layer_b = HiFP8FakeQuantizedLinear(
+            32, 64, bias=False,
+            activation_config=shared_config,
+            weight_config=HiFP8FakeQuantizeConfig(),
+            device="cuda", dtype=torch.bfloat16,
+        )
+
+        # Set DIFFERENT scales on each layer's quantizer
+        scale_a = torch.ones(1, 1, device="cuda", dtype=torch.float32) * 0.01
+        scale_b = torch.ones(1, 1, device="cuda", dtype=torch.float32) * 100.0
+        layer_a.set_static_scales(activation_scale=scale_a)
+        layer_b.set_static_scales(activation_scale=scale_b)
+
+        # Verify scales are independent (the old bug: scale_b would overwrite scale_a)
+        self.assertTrue(torch.equal(
+            layer_a.activation_fake_quantizer.static_scale, scale_a))
+        self.assertTrue(torch.equal(
+            layer_b.activation_fake_quantizer.static_scale, scale_b))
+
+        # Verify different forward behavior
+        x = torch.randn(1, 32, device="cuda", dtype=torch.bfloat16)
+        out_a = layer_a(x)
+        out_b = layer_b(x)
+        # With wildly different scales, outputs must differ
+        self.assertFalse(torch.equal(out_a, out_b))
 
 
 class TestSmoothQuant(unittest.TestCase):
@@ -533,24 +584,27 @@ class TestBufferPersistence(unittest.TestCase):
 
     @_requires_cuda
     def test_static_scales_saved_in_state_dict(self):
-        """Verify static scales appear in state_dict."""
+        """Verify static scales appear in state_dict on quantizer sub-modules."""
         fq_linear = HiFP8FakeQuantizedLinear(
             64, 128, bias=False,
             weight_config=HiFP8FakeQuantizeConfig(),
+            activation_config=HiFP8FakeQuantizeConfig(),
             device="cuda", dtype=torch.bfloat16,
         )
 
-        # Set static scales
+        # Set static scales (delegated to child quantizer modules)
         weight_scale = torch.ones(128, 1, device="cuda", dtype=torch.float32) * 0.01
         activation_scale = torch.ones(1, 1, device="cuda", dtype=torch.float32) * 0.02
         fq_linear.set_static_scales(weight_scale, activation_scale)
 
-        # Verify buffers in state_dict
+        # Verify buffers in state_dict (now under quantizer namespace)
         state_dict = fq_linear.state_dict()
-        self.assertIn("weight_static_scale", state_dict)
-        self.assertIn("activation_static_scale", state_dict)
-        self.assertTrue(torch.equal(state_dict["weight_static_scale"], weight_scale))
-        self.assertTrue(torch.equal(state_dict["activation_static_scale"], activation_scale))
+        self.assertIn("weight_fake_quantizer.static_scale", state_dict)
+        self.assertIn("activation_fake_quantizer.static_scale", state_dict)
+        self.assertTrue(torch.equal(
+            state_dict["weight_fake_quantizer.static_scale"], weight_scale))
+        self.assertTrue(torch.equal(
+            state_dict["activation_fake_quantizer.static_scale"], activation_scale))
 
     @_requires_cuda
     def test_buffer_survives_save_load_cycle(self):

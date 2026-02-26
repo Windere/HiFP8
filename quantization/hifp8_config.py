@@ -25,51 +25,39 @@ class QuantMode(str, Enum):
 @dataclass
 class HiFP8FakeQuantizeConfig:
     """
-    Configuration for HiFP8 fake quantization of a single tensor (weight or activation).
+    Unified configuration for HiFP8 fake quantization.
+
+    Used for weight, activation, and KV cache quantization. Each consumer
+    reads only the fields it needs:
+      - Weight/activation: granularity, target_dtype, mode, param1, param2, enabled
+      - KV cache: enabled, target_dtype, mode, param1, param2 (granularity is hardcoded to per-token)
+
+    This is a pure configuration template shared across layers. Per-layer state
+    (e.g., calibrated static scales) is stored on the quantizer modules, not here.
 
     Attributes:
         granularity: Quantization granularity (PerRow, PerTensor, PerToken, PerAxis).
-                     Default: PerRow().
+                     Default: PerRow(). Ignored by KV cache (hardcoded per-token).
         target_dtype: Target FP8 dtype for placeholder. Default: torch.float8_e4m3fn.
         mode: Quantization mode (DYNAMIC or STATIC). Default: DYNAMIC.
-        static_scale: Pre-computed scale for static quantization. Required when
-                      mode=STATIC. Default: None.
         param1: Reserved for future HiFP8 CUDA kernel parameter.
         param2: Reserved for future HiFP8 CUDA kernel parameter.
         enabled: Whether fake quantization is active. Default: True.
-        use_uint8_encoding: Whether to use real uint8 encoding (vs FP8 placeholder).
-                           Default: False (use FP8 placeholder).
+        scale_factor: Divisor in scale = amax / scale_factor. Default: 1.0.
+                      Set to 1.0 to normalize into [-1, 1] (highest LUT precision).
+                      Set to HIF8_MAX (32768) to use full HiFloat8 range.
     """
     granularity: object = field(default_factory=PerRow)
     target_dtype: torch.dtype = torch.float8_e4m3fn
     mode: QuantMode = QuantMode.DYNAMIC
-    static_scale: Optional[torch.Tensor] = None
     param1: int = 0
     param2: int = 0
     enabled: bool = True
-    use_uint8_encoding: bool = False
+    scale_factor: float = 1.0
 
 
-@dataclass
-class HiFP8KVCacheConfig:
-    """
-    Configuration for HiFP8 KV cache quantization.
-
-    Attributes:
-        enabled: Whether KV cache quantization is active. Default: False.
-        target_dtype: Target FP8 dtype. Default: torch.float8_e4m3fn.
-        mode: Quantization mode:
-              - DYNAMIC (fake quant): Store BF16, quantize on read (for calibration)
-              - STATIC (real quant): Store FP8 + scales (for inference memory savings)
-              Default: DYNAMIC.
-        param1: Reserved for future HiFP8 CUDA kernel parameter.
-        param2: Reserved for future HiFP8 CUDA kernel parameter.
-    """
-    enabled: bool = False
-    target_dtype: torch.dtype = torch.float8_e4m3fn
-    mode: QuantMode = QuantMode.DYNAMIC
-    param1: int = 0
-    param2: int = 0
+# Backward compatibility alias
+HiFP8KVCacheConfig = HiFP8FakeQuantizeConfig
 
 
 @dataclass
@@ -99,6 +87,6 @@ class HiFP8QuantizationConfig(AOBaseConfig):
         default_factory=HiFP8FakeQuantizeConfig
     )
     activation_config: Optional[HiFP8FakeQuantizeConfig] = None
-    kv_cache_config: Optional[HiFP8KVCacheConfig] = None
+    kv_cache_config: Optional[HiFP8FakeQuantizeConfig] = None
     smooth_alpha: Optional[float] = None
     export_mode: str = "fp8"

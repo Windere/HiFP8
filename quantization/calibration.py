@@ -13,6 +13,7 @@ import torch.nn as nn
 from torchao.quantization.quant_primitives import _choose_scale_float8
 from torchao.quantization.utils import get_block_size
 
+from custom_ops.hifp8_ops import get_backend
 from .hifp8_linear import HiFP8FakeQuantizedLinear
 from .hifp8_config import QuantMode
 
@@ -28,10 +29,12 @@ class HiFP8ActivationObserver(nn.Module):
         self,
         granularity,
         target_dtype: torch.dtype = torch.float8_e4m3fn,
+        scale_factor: float = 1.0,
     ):
         super().__init__()
         self.granularity = granularity
         self.target_dtype = target_dtype
+        self.scale_factor = scale_factor
         self.min_val = None
         self.max_val = None
 
@@ -74,25 +77,31 @@ class HiFP8ActivationObserver(nn.Module):
         """
         Calculate quantization scale based on observed min/max.
 
+        For HiFloat8 backend:
+            scale = amax / scale_factor
+        For FP8 fallback:
+            scale = amax / fp8_max
+
         Returns:
             Scale tensor for static quantization.
         """
         if self.min_val is None or self.max_val is None:
             raise RuntimeError("No observations collected. Run forward passes first.")
 
-        # Use torchao's FP8 scale computation
-        # We'll use a dummy tensor to get the shape right, then compute scale from min/max
         abs_max = torch.maximum(torch.abs(self.min_val), torch.abs(self.max_val))
-
-        # FP8 e4m3 max value
-        if self.target_dtype == torch.float8_e4m3fn:
-            fp8_max = torch.finfo(torch.float8_e4m3fn).max
-        else:
-            fp8_max = torch.finfo(torch.float8_e5m2).max
-
-        # Scale = abs_max / fp8_max
         eps = torch.finfo(torch.float32).eps
-        scale = abs_max / (fp8_max + eps)
+        abs_max = abs_max.clamp(min=eps)
+
+        if get_backend() == "hifp8":
+            # HiFloat8: scale = amax / scale_factor
+            scale = (abs_max / self.scale_factor).to(torch.float32)
+        else:
+            # FP8 fallback: scale = amax / fp8_max
+            if self.target_dtype == torch.float8_e4m3fn:
+                fp8_max = torch.finfo(torch.float8_e4m3fn).max
+            else:
+                fp8_max = torch.finfo(torch.float8_e5m2).max
+            scale = abs_max / fp8_max
 
         return scale
 
@@ -174,6 +183,7 @@ def calibrate_model(
             obs = HiFP8ActivationObserver(
                 granularity=config.granularity,
                 target_dtype=config.target_dtype,
+                scale_factor=config.scale_factor,
             ).to(module.weight.device)
             observers[name]["activation"] = obs
 
@@ -229,12 +239,8 @@ def calibrate_model(
             obs = layer_obs["activation"]
             scale = obs.calculate_scale()
 
-            # Store scale as buffer
+            # Store scale as buffer on the quantizer (per-layer, not on shared config)
             module.set_static_scales(activation_scale=scale)
-
-            # Update config to static mode
-            module.activation_fake_quantizer.config.mode = QuantMode.STATIC
-            module.activation_fake_quantizer.config.static_scale = scale
 
             print(f"[Calibration] {name}: activation scale shape={scale.shape}, "
                   f"mean={scale.mean().item():.6f}")

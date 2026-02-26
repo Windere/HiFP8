@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 
 from quantization.hifp8_linear import HiFP8FakeQuantizedLinear
-from quantization.hifp8_config import QuantMode, HiFP8KVCacheConfig
+from quantization.hifp8_config import QuantMode, HiFP8FakeQuantizeConfig
 
 # Import uint8 export (if available)
 try:
@@ -31,7 +31,7 @@ def export_for_vllm(
     tokenizer,
     output_dir: str,
     config_dict: Optional[dict] = None,
-    kv_cache_config: Optional[HiFP8KVCacheConfig] = None,
+    kv_cache_config: Optional[HiFP8FakeQuantizeConfig] = None,
     export_mode: str = "bf16",
     param1: int = 0,
     param2: int = 0,
@@ -92,7 +92,7 @@ def export_bf16_for_vllm(
     tokenizer,
     output_dir: str,
     config_dict: Optional[dict] = None,
-    kv_cache_config: Optional[HiFP8KVCacheConfig] = None,
+    kv_cache_config: Optional[HiFP8FakeQuantizeConfig] = None,
 ):
     """
     Export HiFP8 model as BF16 format with scales embedded as buffers.
@@ -134,11 +134,15 @@ def export_bf16_for_vllm(
         if not isinstance(module, HiFP8FakeQuantizedLinear):
             continue
 
+        has_w_scale = (module.weight_fake_quantizer is not None
+                       and module.weight_fake_quantizer.static_scale is not None)
+        has_a_scale = (module.activation_fake_quantizer is not None
+                       and module.activation_fake_quantizer.static_scale is not None)
         layer_info = {
             "quantization_method": "hifp8",
             "has_smooth_scale": module.smooth_scale is not None,
-            "has_weight_static_scale": module.weight_static_scale is not None,
-            "has_activation_static_scale": module.activation_static_scale is not None,
+            "has_weight_static_scale": has_w_scale,
+            "has_activation_static_scale": has_a_scale,
             "granularity": {},
         }
 
@@ -242,7 +246,7 @@ def load_bf16_metadata(metadata_path: str) -> dict:
         return json.load(f)
 
 
-def load_kv_cache_config(metadata_or_path) -> Optional[HiFP8KVCacheConfig]:
+def load_kv_cache_config(metadata_or_path) -> Optional[HiFP8FakeQuantizeConfig]:
     """
     Load KV cache configuration from metadata.
 
@@ -250,7 +254,7 @@ def load_kv_cache_config(metadata_or_path) -> Optional[HiFP8KVCacheConfig]:
         metadata_or_path: Either a metadata dict or a path to model directory or metadata file.
 
     Returns:
-        HiFP8KVCacheConfig if KV cache quantization is enabled, else None.
+        HiFP8FakeQuantizeConfig if KV cache quantization is enabled, else None.
     """
     if isinstance(metadata_or_path, (str, Path)):
         # Load from path
@@ -283,7 +287,7 @@ def load_kv_cache_config(metadata_or_path) -> Optional[HiFP8KVCacheConfig]:
     mode_str = kv_config_dict.get("mode", "dynamic")
     mode = QuantMode(mode_str)
 
-    return HiFP8KVCacheConfig(
+    return HiFP8FakeQuantizeConfig(
         enabled=True,
         target_dtype=target_dtype,
         mode=mode,
