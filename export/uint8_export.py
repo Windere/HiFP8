@@ -76,41 +76,66 @@ def export_uint8_for_vllm(
             if len(list(module.children())) == 0:  # leaf module
                 linear_weight_info[f"{name}.weight"] = 1.0
 
-    # Process all parameters
+    # Collect 3D+ weight tensors (e.g., MoE fused expert weights like [num_experts, in, out])
+    # These are not nn.Linear but should still be quantized
+    expert_weight_info = {}  # param_name -> scale_factor
+    _skip_suffixes = ("_bias", ".bias")
+    _skip_names = ("embed_tokens", "lm_head")
     for param_name, param in model.named_parameters():
         if param_name in linear_weight_info:
-            # Encode this Linear weight to uint8
+            continue
+        if param.dim() >= 3 and not any(param_name.endswith(s) for s in _skip_suffixes):
+            # Skip embeddings and biases
+            if not any(s in param_name for s in _skip_names):
+                expert_weight_info[param_name] = 1.0
+
+    if expert_weight_info:
+        print(f"[uint8 Export] Found {len(expert_weight_info)} fused expert weight tensors")
+
+    # Process all parameters
+    for param_name, param in model.named_parameters():
+        if param_name in linear_weight_info or param_name in expert_weight_info:
             w = param.data
-            device = w.device
             original_bytes = w.numel() * w.element_size()
             total_original_bytes += original_bytes
+            sf = linear_weight_info.get(param_name, expert_weight_info.get(param_name, 1.0))
 
-            # Move to CUDA for encoding, then back to CPU for saving
-            w_f32 = w.float().cuda()
-            sf = linear_weight_info[param_name]
-            uint8_data, scale = hifp8_encode_uint8(w_f32, scale_factor=sf)
+            # For 3D+ tensors, flatten leading dims → 2D, encode, reshape back
+            orig_shape = w.shape
+            if w.dim() >= 3:
+                w_2d = w.reshape(-1, w.shape[-1]).float().cuda()
+            else:
+                w_2d = w.float().cuda()
 
-            uint8_key = param_name.replace(".weight", ".weight_uint8")
-            scale_key = param_name.replace(".weight", ".weight_scale")
+            uint8_data, scale = hifp8_encode_uint8(w_2d, scale_factor=sf)
+
+            # Restore original shape for uint8_data
+            if len(orig_shape) >= 3:
+                uint8_data = uint8_data.reshape(orig_shape)
+
+            # Use suffix based on whether it's a named weight or bare param
+            if param_name.endswith(".weight"):
+                uint8_key = param_name.replace(".weight", ".weight_uint8")
+                scale_key = param_name.replace(".weight", ".weight_scale")
+            else:
+                uint8_key = param_name + "_uint8"
+                scale_key = param_name + "_scale"
+
             state_dict[uint8_key] = uint8_data.cpu()
             state_dict[scale_key] = scale.cpu()
 
             uint8_bytes = uint8_data.numel() + scale.numel() * 4
             total_uint8_bytes += uint8_bytes
 
-            # Record layer info
-            module_name = param_name.rsplit(".weight", 1)[0]
-            quantized_layers[module_name] = {
-                "in_features": w.shape[1],
-                "out_features": w.shape[0],
-                "weight_shape": list(w.shape),
+            quantized_layers[param_name] = {
+                "weight_shape": list(orig_shape),
                 "scale_shape": list(scale.shape),
                 "quantization": "hifloat8_uint8",
             }
 
-            del w_f32, uint8_data, scale
+            del w_2d, uint8_data, scale
         else:
-            # Non-Linear param: save as-is
+            # Non-quantizable param: save as-is
             state_dict[param_name] = param.data.cpu()
 
     # Also save buffers (layer norms, etc.)

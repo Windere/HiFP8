@@ -154,10 +154,12 @@ def decode_uint8_to_bf16_for_vllm(uint8_dir: str):
                 uint8_data = tensor.cuda()
                 scale = state_dict[scale_key].cuda()
 
-                if HAS_CUDA_KERNELS:
-                    decoded = hifp8_decode_uint8(uint8_data, scale, output_dtype=torch.bfloat16)
-                else:
-                    decoded = (uint8_data.float() * scale.unsqueeze(1)).to(torch.bfloat16)
+                if not HAS_CUDA_KERNELS:
+                    raise RuntimeError(
+                        "Cannot decode HiFloat8 uint8 without CUDA kernels. "
+                        "uint8 values are LUT indices, not linear integers."
+                    )
+                decoded = hifp8_decode_uint8(uint8_data, scale, output_dtype=torch.bfloat16)
 
                 new_state_dict[f"{layer_name}.weight"] = decoded.cpu()
                 decoded_count += 1

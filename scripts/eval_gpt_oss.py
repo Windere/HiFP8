@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-Compare HiFP8 quantization quality across different scale_factor values on ARC-Easy.
+Evaluate GPT-OSS 20B with HiFP8 uint8 quantization on ARC benchmark.
 
-Flow per scale_factor:
-  1. Load model, apply HiFP8 fake quant with given scale_factor
-  2. Export as uint8 (real HiFloat8 encoding)
-  3. Decode uint8 → BF16 (for vLLM compatibility)
-  4. Start vLLM server
-  5. Run evalscope ARC-Easy
-  6. Kill server
-
-Also tests baseline (no quantization) for reference.
+Flow:
+  1. Baseline: start vLLM with original BF16 model → evalscope ARC
+  2. HiFP8 sf=1: load model → HiFP8 fake quant → export uint8 → decode → vLLM → ARC
 
 Usage:
-    PYTHONPATH="$(pwd):$(pwd)/ao:$PYTHONPATH" python scripts/eval_scale_factor.py
-    PYTHONPATH="$(pwd):$(pwd)/ao:$PYTHONPATH" python scripts/eval_scale_factor.py --limit 200
+    PYTHONPATH="$(pwd):$(pwd)/ao:$PYTHONPATH" CUDA_VISIBLE_DEVICES=0,3 \
+        python scripts/eval_gpt_oss.py --tensor-parallel-size 2
+
+    # Quick test with limited samples
+    PYTHONPATH="$(pwd):$(pwd)/ao:$PYTHONPATH" CUDA_VISIBLE_DEVICES=0,3 \
+        python scripts/eval_gpt_oss.py --tensor-parallel-size 2 --limit 50
 """
 
 import argparse
@@ -34,20 +32,24 @@ sys.path.insert(0, str(PROJECT_ROOT / "ao"))
 os.environ.setdefault("HF_HOME", "/home/data/.cache/huggingface")
 os.environ.setdefault("MODELSCOPE_CACHE", "/home/data/.cache/modelscope")
 
-OUTPUT_BASE = Path("/home/data/hifp8_eval_sf")
+OUTPUT_BASE = Path("/home/data/hifp8_eval_gpt_oss")
 PORT = 8020
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Scale factor comparison on ARC-Easy")
-    parser.add_argument("--model", type=str, default="/home/models/Qwen3-0.6B")
+    parser = argparse.ArgumentParser(description="GPT-OSS 20B HiFP8 evaluation on ARC")
+    parser.add_argument("--model", type=str, default="/home/models/gpt-oss-20b-BF16")
     parser.add_argument("--limit", type=int, default=None,
                         help="Max samples per subset (None = full)")
-    parser.add_argument("--gpu", type=str, default="0")
+    parser.add_argument("--gpu", type=str, default="0,3")
+    parser.add_argument("--tensor-parallel-size", type=int, default=2,
+                        help="vLLM tensor parallel size (default: 2 for multi-GPU)")
     parser.add_argument("--dataset-hub", type=str, default="modelscope")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85,
-                        help="vLLM GPU memory utilization (higher = larger batch)")
-    parser.add_argument("--max-model-len", type=int, default=2048)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.90,
+                        help="vLLM GPU memory utilization")
+    parser.add_argument("--max-model-len", type=int, default=4096,
+                        help="Max sequence length (lower to save memory)")
+    parser.add_argument("--port", type=int, default=PORT)
     return parser.parse_args()
 
 
@@ -55,42 +57,69 @@ def parse_args():
 # Export
 # ============================================================
 
-def export_uint8_model(model_path: str, output_dir: str, scale_factor: float):
-    """Load model, apply HiFP8 with given scale_factor, export as uint8."""
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from quantization.hifp8_config import HiFP8FakeQuantizeConfig
-    from quantization.hifp8_linear import prepare_hifp8_fake_quant
-    from export.bf16_export import export_for_vllm
+def export_uint8_model(model_path: str, output_dir: str, scale_factor: float,
+                       gpu: str = "0,3"):
+    """Run export in a subprocess to guarantee full GPU memory release afterward."""
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = gpu
+    env["PYTHONPATH"] = f"{PROJECT_ROOT}:{PROJECT_ROOT / 'ao'}:{env.get('PYTHONPATH', '')}"
+    env["HIFP8_MODEL_PATH"] = model_path
+    env["HIFP8_OUTPUT_DIR"] = output_dir
+    env["HIFP8_SCALE_FACTOR"] = str(scale_factor)
 
-    print(f"  Loading model: {model_path}")
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=torch.bfloat16, device_map="cuda:0",
+    script = """
+import os, torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from quantization.hifp8_config import HiFP8FakeQuantizeConfig
+from quantization.hifp8_linear import prepare_hifp8_fake_quant
+from export.bf16_export import export_for_vllm
+
+model_path = os.environ["HIFP8_MODEL_PATH"]
+output_dir = os.environ["HIFP8_OUTPUT_DIR"]
+scale_factor = float(os.environ["HIFP8_SCALE_FACTOR"])
+
+print(f"  Loading model: {model_path}")
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+model = AutoModelForCausalLM.from_pretrained(
+    model_path, torch_dtype=torch.bfloat16, device_map="auto",
+)
+
+print(f"  Applying HiFP8 fake quant (scale_factor={scale_factor})...")
+w_config = HiFP8FakeQuantizeConfig(scale_factor=scale_factor)
+prepare_hifp8_fake_quant(model, weight_config=w_config)
+
+print(f"  Exporting uint8 to {output_dir}")
+export_for_vllm(
+    model=model,
+    tokenizer=tokenizer,
+    output_dir=output_dir,
+    export_mode="uint8",
+)
+print("  Export subprocess done.")
+"""
+
+    print(f"  Running export in subprocess (GPU={gpu})...")
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env, capture_output=True, text=True, timeout=1800,
     )
+    if result.returncode != 0:
+        print(f"  Export FAILED:\n{result.stderr[-2000:]}")
+        raise RuntimeError("Export subprocess failed")
+    print(result.stdout)
 
-    print(f"  Applying HiFP8 fake quant (scale_factor={scale_factor})...")
-    w_config = HiFP8FakeQuantizeConfig(scale_factor=scale_factor)
-    prepare_hifp8_fake_quant(model, weight_config=w_config)
-
-    print(f"  Exporting uint8 to {output_dir}")
-    export_for_vllm(
-        model=model,
-        tokenizer=tokenizer,
-        output_dir=output_dir,
-        export_mode="uint8",
-    )
-
-    # Decode uint8 → BF16 for vLLM compatibility
+    # Decode uint8 → BF16 (lightweight, only needs 1 GPU briefly)
     print(f"  Decoding uint8 → BF16 for vLLM serving...")
     _decode_uint8_to_bf16(output_dir)
 
-    del model
-    torch.cuda.empty_cache()
-
 
 def _decode_uint8_to_bf16(uint8_dir: str):
-    """Decode uint8 safetensors to BF16 for vLLM compatibility."""
+    """Decode uint8 safetensors to BF16 for vLLM compatibility.
+
+    Handles both patterns:
+      - {name}.weight_uint8 / {name}.weight_scale  (nn.Linear weights)
+      - {name}_uint8 / {name}_scale                (fused expert 3D weights)
+    """
     import torch
     from safetensors.torch import load_file, save_file
     from custom_ops.hifp8_uint8_ops import hifp8_decode_uint8, HAS_CUDA_KERNELS
@@ -104,24 +133,50 @@ def _decode_uint8_to_bf16(uint8_dir: str):
     new_state_dict = {}
     decoded_count = 0
 
-    for key, tensor in state_dict.items():
+    # Build set of uint8 keys and their corresponding scale/output keys
+    decode_pairs = {}  # uint8_key -> (scale_key, output_key)
+    for key in state_dict:
         if key.endswith(".weight_uint8"):
-            layer_name = key.replace(".weight_uint8", "")
-            scale_key = f"{layer_name}.weight_scale"
-            if scale_key in state_dict:
-                uint8_data = tensor.cuda()
+            base = key[:-len("_uint8")]  # strip _uint8 → {name}.weight
+            scale_key = base + "_scale"
+            decode_pairs[key] = (scale_key, base)  # output = {name}.weight
+        elif key.endswith("_uint8") and not key.endswith(".weight_uint8"):
+            base = key[:-len("_uint8")]  # strip _uint8 → {name}
+            scale_key = base + "_scale"
+            decode_pairs[key] = (scale_key, base)  # output = {name}
+
+    skip_keys = set()
+    for uint8_key, (scale_key, _) in decode_pairs.items():
+        skip_keys.add(uint8_key)
+        skip_keys.add(scale_key)
+
+    for key, tensor in state_dict.items():
+        if key in skip_keys:
+            if key in decode_pairs:
+                scale_key, output_key = decode_pairs[key]
+                if scale_key not in state_dict:
+                    new_state_dict[key] = tensor
+                    continue
+                orig_shape = tensor.shape
+                # Flatten 3D+ → 2D for decode
+                if tensor.dim() >= 3:
+                    flat = tensor.reshape(-1, tensor.shape[-1]).cuda()
+                else:
+                    flat = tensor.cuda()
                 scale = state_dict[scale_key].cuda()
                 if not HAS_CUDA_KERNELS:
                     raise RuntimeError(
                         "Cannot decode HiFloat8 uint8 without CUDA kernels. "
                         "uint8 values are LUT indices, not linear integers."
                     )
-                decoded = hifp8_decode_uint8(uint8_data, scale, output_dtype=torch.bfloat16)
-                new_state_dict[f"{layer_name}.weight"] = decoded.cpu()
+                decoded = hifp8_decode_uint8(flat, scale, output_dtype=torch.bfloat16)
+                # Restore original shape
+                if len(orig_shape) >= 3:
+                    decoded = decoded.reshape(orig_shape)
+                new_state_dict[output_key] = decoded.cpu()
                 decoded_count += 1
-                del uint8_data, scale, decoded
-            continue
-        elif key.endswith(".weight_scale"):
+                del flat, scale, decoded
+            # else: it's a scale_key, skip
             continue
         else:
             new_state_dict[key] = tensor
@@ -129,7 +184,6 @@ def _decode_uint8_to_bf16(uint8_dir: str):
     save_file(new_state_dict, str(st_path))
     print(f"  [Decode] Decoded {decoded_count} layers from uint8 → BF16")
 
-    import torch
     torch.cuda.empty_cache()
 
 
@@ -138,8 +192,9 @@ def _decode_uint8_to_bf16(uint8_dir: str):
 # ============================================================
 
 def start_vllm_server(model_path: str, port: int, gpu: str, model_name: str,
-                      gpu_mem_util: float, max_model_len: int) -> subprocess.Popen:
-    """Start a standard vLLM server."""
+                      gpu_mem_util: float, max_model_len: int,
+                      tensor_parallel_size: int = 1) -> subprocess.Popen:
+    """Start a vLLM server with tensor parallel support."""
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu
     env["PYTHONPATH"] = f"{PROJECT_ROOT}:{PROJECT_ROOT / 'ao'}:{env.get('PYTHONPATH', '')}"
@@ -152,6 +207,7 @@ def start_vllm_server(model_path: str, port: int, gpu: str, model_name: str,
         "--dtype", "bfloat16",
         "--max-model-len", str(max_model_len),
         "--gpu-memory-utilization", str(gpu_mem_util),
+        "--tensor-parallel-size", str(tensor_parallel_size),
         "--trust-remote-code",
         "--disable-log-requests",
     ]
@@ -160,29 +216,30 @@ def start_vllm_server(model_path: str, port: int, gpu: str, model_name: str,
     log_file = open(log_path, "w")
 
     print(f"  Starting vLLM server: {model_name} on port {port}")
-    print(f"  GPU mem util: {gpu_mem_util}, max_model_len: {max_model_len}")
+    print(f"  TP={tensor_parallel_size}, GPU={gpu}, mem_util={gpu_mem_util}, max_len={max_model_len}")
     print(f"  Log: {log_path}")
 
     proc = subprocess.Popen(
         cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT,
-        preexec_fn=os.setsid,
+        start_new_session=True,
     )
     return proc
 
 
-def wait_for_server(port: int, timeout: int = 300, name: str = "") -> bool:
-    """Wait for server health check."""
+def wait_for_server(port: int, timeout: int = 600, name: str = "") -> bool:
+    """Wait for server health check (longer timeout for large models)."""
     import urllib.request
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
             req = urllib.request.urlopen(f"http://localhost:{port}/health", timeout=3)
             if req.status == 200:
-                print(f"  {name} ready on port {port}")
+                elapsed = int(time.time() - start_time)
+                print(f"  {name} ready on port {port} (took {elapsed}s)")
                 return True
         except Exception:
             pass
-        time.sleep(3)
+        time.sleep(5)
     print(f"  {name} FAILED to start within {timeout}s!")
     return False
 
@@ -193,7 +250,7 @@ def kill_server(proc: subprocess.Popen, name: str = ""):
         print(f"  Stopping {name}...")
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            proc.wait(timeout=10)
+            proc.wait(timeout=15)
         except Exception:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -310,13 +367,14 @@ def evaluate_one(label: str, model_path: str, port: int, args,
         model_name=label,
         gpu_mem_util=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
+        tensor_parallel_size=args.tensor_parallel_size,
     )
 
     try:
-        if not wait_for_server(port, timeout=300, name=label):
+        if not wait_for_server(port, timeout=600, name=label):
             log_path = OUTPUT_BASE / f"server_{label}.log"
             if log_path.exists():
-                print(f"  Server log tail:\n{log_path.read_text()[-1500:]}")
+                print(f"  Server log tail:\n{log_path.read_text()[-2000:]}")
             return {"error": "Server failed to start"}
 
         eval_dir = str(OUTPUT_BASE / "eval_results" / label)
@@ -342,45 +400,35 @@ def main():
     OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
     (OUTPUT_BASE / "eval_results").mkdir(parents=True, exist_ok=True)
 
-    from custom_ops.hifp8_uint8_ops import HIF8_MAX
-
-    scale_factors = {
-        "sf=1": 1.0,
-        f"sf=HIF8_MAX({int(HIF8_MAX)})": HIF8_MAX,
-    }
-
     all_results = {}
 
-    # ---- Baseline ----
+    # ---- Baseline (BF16) ----
     result = evaluate_one(
         label="baseline",
         model_path=args.model,
-        port=PORT,
+        port=args.port,
         args=args,
     )
     all_results["baseline"] = result
 
-    # ---- Each scale_factor ----
-    for label, sf in scale_factors.items():
-        export_dir = str(OUTPUT_BASE / f"export_{label.replace('=', '_')}")
+    # ---- HiFP8 sf=1 (uint8 quantization) ----
+    export_dir = str(OUTPUT_BASE / "export_hifp8_sf1")
 
-        def make_export_fn(sf_val, out_dir):
-            def fn():
-                export_uint8_model(args.model, out_dir, scale_factor=sf_val)
-            return fn
+    def export_fn():
+        export_uint8_model(args.model, export_dir, scale_factor=1.0, gpu=args.gpu)
 
-        result = evaluate_one(
-            label=label,
-            model_path=export_dir,
-            port=PORT,
-            args=args,
-            export_fn=make_export_fn(sf, export_dir),
-        )
-        all_results[label] = result
+    result = evaluate_one(
+        label="hifp8_sf1",
+        model_path=export_dir,
+        port=args.port,
+        args=args,
+        export_fn=export_fn,
+    )
+    all_results["hifp8_sf1"] = result
 
     # ---- Summary ----
     print("\n" + "=" * 70)
-    print("SUMMARY: ARC-Easy results with different scale_factor")
+    print("SUMMARY: GPT-OSS 20B — Baseline vs HiFP8 (sf=1)")
     print("=" * 70)
 
     for label, res in all_results.items():
@@ -399,7 +447,7 @@ def main():
                             print(f"  {k}: {v}")
 
     # Save to JSON
-    results_file = OUTPUT_BASE / "scale_factor_comparison.json"
+    results_file = OUTPUT_BASE / "gpt_oss_comparison.json"
     serializable = {}
     for k, v in all_results.items():
         serializable[k] = {}

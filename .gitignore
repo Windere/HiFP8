@@ -1,3 +1,20 @@
-.pyc
 __pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+*.so
+*.egg-info/
+build/
+dist/
+custom_ops/build/
+
+# Output
 output/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
