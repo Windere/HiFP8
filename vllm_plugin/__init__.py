@@ -1,8 +1,15 @@
 """
 vLLM plugin for HiFP8 quantization.
 
-Provides utilities to load BF16-exported HiFP8 models in vLLM and apply
-fake quantization at runtime.
+LEGACY: This module uses monkey-patching and a custom loader to integrate
+HiFP8 with standard vLLM. For new deployments, prefer using:
+
+    export.hif8_export.export_for_hif8_vllm()
+
+which exports a checkpoint that the vLLM-HiF8 fork (vllm-hifp8) can load
+natively via quant_method="hif8" in config.json, without any monkey-patching.
+
+See scripts/eval_hif8_vllm.py for an end-to-end example.
 """
 
 from .hifp8_loader import apply_hifp8_fake_quant_to_vllm_model, load_hifp8_metadata

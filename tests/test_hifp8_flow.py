@@ -743,5 +743,55 @@ class TestVLLMLoader(unittest.TestCase):
                 print(f"vLLM loader test skipped due to: {e}")
 
 
+class TestHiFP8DirectFakeQuant(unittest.TestCase):
+    """Tests for direct HiFloat8 fake quant via C++ kernel."""
+
+    @_requires_cuda
+    def test_direct_fake_quant_cuda_float32(self):
+        from custom_ops.hifp8_uint8_ops import hifp8_fake_quant_direct
+        x = torch.randn(32, 64, device="cuda", dtype=torch.float32)
+        out = hifp8_fake_quant_direct(x)
+        self.assertEqual(out.dtype, torch.float32)
+        self.assertEqual(out.shape, x.shape)
+        # Should introduce quantization noise
+        self.assertFalse(torch.equal(x, out))
+        # But stay close
+        torch.testing.assert_close(x, out, atol=0.5, rtol=0.2)
+
+    @_requires_cuda
+    def test_direct_fake_quant_cuda_bfloat16(self):
+        from custom_ops.hifp8_uint8_ops import hifp8_fake_quant_direct
+        x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
+        out = hifp8_fake_quant_direct(x)
+        self.assertEqual(out.dtype, torch.bfloat16)
+        self.assertEqual(out.shape, x.shape)
+
+    @_requires_cuda
+    def test_direct_fake_quant_cuda_float64(self):
+        from custom_ops.hifp8_uint8_ops import hifp8_fake_quant_direct
+        x = torch.randn(32, 64, device="cuda", dtype=torch.float64)
+        out = hifp8_fake_quant_direct(x)
+        self.assertEqual(out.dtype, torch.float64)
+        self.assertEqual(out.shape, x.shape)
+        self.assertFalse(torch.equal(x, out))
+
+    def test_direct_fake_quant_cpu(self):
+        from custom_ops.hifp8_uint8_ops import hifp8_fake_quant_direct
+        x = torch.randn(32, 64, dtype=torch.float32)
+        out = hifp8_fake_quant_direct(x)
+        self.assertEqual(out.dtype, torch.float32)
+        self.assertEqual(out.shape, x.shape)
+        self.assertFalse(torch.equal(x, out))
+        torch.testing.assert_close(x, out, atol=0.5, rtol=0.2)
+
+    @_requires_cuda
+    def test_direct_cpu_vs_cuda_consistency(self):
+        from custom_ops.hifp8_uint8_ops import hifp8_fake_quant_direct
+        x = torch.randn(128, 64, dtype=torch.float32)
+        out_cpu = hifp8_fake_quant_direct(x)
+        out_cuda = hifp8_fake_quant_direct(x.cuda()).cpu()
+        torch.testing.assert_close(out_cpu, out_cuda, atol=0, rtol=0)
+
+
 if __name__ == "__main__":
     unittest.main()

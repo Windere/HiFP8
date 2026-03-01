@@ -185,3 +185,16 @@ def hifp8_decode_uint8_simple(
     if not data.is_cuda:
         raise ValueError("Requires CUDA tensor")
     return hif8_cuda.hif8_decode_cuda(data).to(output_dtype)
+
+
+def hifp8_fake_quant_direct(x: torch.Tensor) -> torch.Tensor:
+    """Direct HiFloat8 fake quant via C++ kernel (CPU or CUDA, any float dtype).
+
+    Rounds tensor values to the nearest HiFloat8 representable value,
+    keeping the original data type. No scaling is applied.
+
+    Supports float16, bfloat16, float32, float64 on both CPU and CUDA.
+    """
+    if not HAS_CUDA_KERNELS:
+        raise RuntimeError("HiFloat8 CUDA kernels not available")
+    return hif8_cuda.fake_quant(x.contiguous())

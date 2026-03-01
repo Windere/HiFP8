@@ -195,6 +195,170 @@ torch::Tensor hif8_decode_with_scale_cuda(torch::Tensor data, torch::Tensor scal
     return output;
 }
 
+// ============================================================================
+// HiFloat8 fake quantization: rounds values to nearest HiF8 representable
+// value, keeping the original data type. Supports float/double on CUDA + CPU.
+// ============================================================================
+
+// --- Core rounding function (double precision, CUDA) ---
+__device__ __forceinline__ double hif8_round_double(double x) {
+    if (isnan(x) || isinf(x) || x == 0.0)
+        return x;
+
+    double sign = copysign(1.0, x);
+    double ax = fabs(x);
+
+    // Underflow: 2^(-23)
+    if (ax < 1.1920928955078125e-07)
+        return 0.0;
+
+    // Extract exponent via frexp
+    int E_raw;
+    frexp(ax, &E_raw);
+    int E = E_raw - 1;
+
+    // Denormal region
+    if (E <= -16) {
+        if (E <= -23)
+            return sign * 2.384185791015625e-07;  // 2^(-22)
+
+        double lower = ldexp(1.0, E);
+        double upper = ldexp(1.0, E + 1);
+        double mid = 1.5 * lower;
+        double result = (ax >= mid) ? upper : lower;
+        if (result < 2.384185791015625e-07)
+            return 0.0;
+        return sign * result;
+    }
+
+    if (E > 15)
+        return sign * (double)INFINITY;
+
+    int abs_E = (E < 0) ? -E : E;
+    int mantissa_bits = (abs_E <= 3) ? 3 : (abs_E <= 7) ? 2 : 1;
+
+    double shifted = ldexp(ax, mantissa_bits - E);
+    double rounded = floor(shifted + 0.5);
+
+    double carry_threshold = ldexp(1.0, mantissa_bits + 1);
+    if (rounded >= carry_threshold) {
+        int new_E = E + 1;
+        if (new_E > 15)
+            return sign * (double)INFINITY;
+        return sign * ldexp(1.0, new_E);
+    }
+
+    double result = ldexp(rounded, E - mantissa_bits);
+    if (result >= 49152.0)
+        return sign * (double)INFINITY;
+    return sign * result;
+}
+
+// --- Templated CUDA fake quant kernel ---
+template <typename scalar_t>
+__global__ void hif8_fake_quant_kernel(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
+    int64_t n
+) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        // For half/bfloat16/float32: compute in float
+        float val = static_cast<float>(input[idx]);
+        float result = hif8_round_float(val);
+        output[idx] = static_cast<scalar_t>(result);
+    }
+}
+
+// Specialization for double
+template <>
+__global__ void hif8_fake_quant_kernel<double>(
+    double* __restrict__ output,
+    const double* __restrict__ input,
+    int64_t n
+) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = hif8_round_double(input[idx]);
+    }
+}
+
+// --- CUDA host launcher ---
+torch::Tensor hif8_fake_quant_cuda(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+
+    auto output = torch::empty_like(input);
+    int64_t n = input.numel();
+    if (n == 0) return output;
+
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        input.scalar_type(),
+        "hif8_fake_quant_cuda",
+        [&] {
+            hif8_fake_quant_kernel<scalar_t><<<blocks, threads>>>(
+                output.data_ptr<scalar_t>(),
+                input.data_ptr<scalar_t>(),
+                n
+            );
+        }
+    );
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch error: ", cudaGetErrorString(err));
+    return output;
+}
+
+// --- CPU fake quant dispatcher ---
+#include "hif8_round_cpu.h"
+
+torch::Tensor hif8_fake_quant_cpu_impl(torch::Tensor input) {
+    TORCH_CHECK(input.is_cpu(), "Input must be a CPU tensor");
+    auto input_contig = input.contiguous();
+    auto output = torch::empty_like(input_contig);
+    int64_t n = input_contig.numel();
+    if (n == 0) return output;
+
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        input_contig.scalar_type(),
+        "hif8_fake_quant_cpu",
+        [&] {
+            auto* in_ptr = input_contig.data_ptr<scalar_t>();
+            auto* out_ptr = output.data_ptr<scalar_t>();
+
+            if constexpr (std::is_same_v<scalar_t, double>) {
+                for (int64_t i = 0; i < n; i++) {
+                    out_ptr[i] = static_cast<scalar_t>(hif8_round_double_cpu(in_ptr[i]));
+                }
+            } else {
+                for (int64_t i = 0; i < n; i++) {
+                    float val = static_cast<float>(in_ptr[i]);
+                    float result = hif8_round_float_cpu(val);
+                    out_ptr[i] = static_cast<scalar_t>(result);
+                }
+            }
+        }
+    );
+
+    return output;
+}
+
+// --- Unified CPU/CUDA entry point ---
+torch::Tensor hif8_fake_quant(torch::Tensor input) {
+    if (input.is_cuda()) {
+        return hif8_fake_quant_cuda(input);
+    } else {
+        return hif8_fake_quant_cpu_impl(input);
+    }
+}
+
 // Python bindings
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("hif8_encode_cuda", &hif8_encode_cuda, "HiFloat8 encode to uint8 (CUDA)");
@@ -203,4 +367,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "HiFloat8 encode with per-row scaling (CUDA)");
     m.def("hif8_decode_with_scale_cuda", &hif8_decode_with_scale_cuda,
           "HiFloat8 decode with per-row scaling (CUDA)");
+    m.def("fake_quant", &hif8_fake_quant,
+          "HiFloat8 fake quantization (CPU and CUDA).\n"
+          "Rounds tensor values to the nearest HiFloat8 representable value,\n"
+          "keeping the original data type.\n"
+          "Supports float16, bfloat16, float32, float64 on both CPU and CUDA.",
+          py::arg("input"));
 }
