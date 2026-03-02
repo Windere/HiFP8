@@ -81,8 +81,8 @@ export PYTHONPATH="$(pwd):$(pwd)/ao:$PYTHONPATH"
 cd custom_ops && python setup_cuda.py build_ext --inplace && cd ..
 ```
 
-**依赖**：Python >= 3.10, PyTorch >= 2.0 (CUDA), safetensors, transformers
-**部署依赖**（可选）：vLLM 0.12.0（标准版或 [HiF8 fork](https://github.com/XiangWanggithub/vllm.git)）, evalscope
+**Requirements**: Python >= 3.10, PyTorch >= 2.0 (CUDA), safetensors, transformers
+**Optional (deployment)**: vLLM 0.12.0 (standard or [HiF8 fork](https://github.com/XiangWanggithub/vllm.git)), evalscope
 
 ### 模式 1：BF16 伪量化
 
