@@ -161,16 +161,79 @@ python -m vllm.entrypoints.openai.api_server \
 
 ### vLLM 部署
 
-v4 server 自动检测量化格式（BF16 / uint8 / 无量化）：
+本项目提供两种 vLLM 部署路径：
+
+#### 路径 A：vLLM-HiF8 fork（推荐，支持 torch.compile）
+
+基于同事修改的 vLLM fork，原生支持 HiFloat8 量化推理，支持 torch.compile 加速。
+
+**项目地址**：https://github.com/XiangWanggithub/vllm.git （分支：`v0.12.0`）
+
+**安装**：
+```bash
+git clone -b v0.12.0 https://github.com/XiangWanggithub/vllm.git vllm-hifp8
+cd vllm-hifp8
+VLLM_USE_PRECOMPILED=1 pip install -e .
+```
+
+**工作原理**：vLLM-HiF8 fork 在 `config.json` 中识别 `quant_method: "hif8"`，加载预量化的 BF16 权重和 per-channel `weight_scale`，运行时仅对 activation 做 fake quant，支持 torch.compile 图模式加速。
+
+**搭配导出模式 3（HiF8 预量化导出）使用**：
+```bash
+# 启动 server（torch.compile + 禁用 CUDA graph）
+python -m vllm.entrypoints.openai.api_server \
+    --model ./output/gpt_oss_hif8 \
+    --served-model-name gpt-oss-hif8 \
+    --tensor-parallel-size 2 \
+    --compilation-config '{"cudagraph_mode": 0}' \
+    --gpu-memory-utilization 0.95 \
+    --port 8000
+```
+
+> 注意：HiF8 的 fake_quant kernel 内部分配内存，不兼容 CUDA graph capture，需设置 `cudagraph_mode: 0`。这保持 torch.compile 优化但跳过 CUDA graph。
+
+#### 路径 B：vLLM 插件（monkey-patching，适用于标准 vLLM）
+
+通过本项目的 `vllm_plugin/` 模块，以 monkey-patching 方式将 HiFP8 量化集成到标准 vLLM 0.12.0 中，无需修改 vLLM 源码。
+
+**搭配导出模式 1（BF16）或模式 2（uint8）使用**：
+
+`vllm_plugin/` 模块说明：
+
+| 文件 | 功能 |
+|------|------|
+| `hifp8_loader.py` | 双模式加载器，自动检测 BF16/uint8 格式 |
+| `hifp8_vllm_patcher.py` | vLLM 0.12.0 架构感知 patcher，patch QKVParallelLinear/RowParallelLinear/ColumnParallelLinear |
+| `hifp8_uint8_linear.py` | uint8 Linear 层，支持 eager（加载时解码）和 lazy（推理时解码）两种策略 |
+| `hifp8_kv_cache_patcher.py` | KV cache 量化 patcher |
 
 ```bash
-# 启动 vLLM server（自动检测格式）
+# 使用 v4 server（自动检测量化格式：BF16 / uint8 / 无量化）
 python scripts/start_vllm_hifp8_server_v4.py \
     --model ./output/qwen3_bf16 \
     --port 8000 \
     --served-model-name qwen3-hifp8
+```
 
-# 测试推理
+v4 server 工作流程：
+1. Hook vLLM 的 `DefaultModelLoader.load_model()`
+2. 读取 `hifp8_metadata.json` 自动检测格式
+3. BF16 格式 → patch forward pass 注入 fake quant
+4. uint8 格式 → 加载时解码 uint8 权重回 BF16
+5. 无量化 → 直接透传，不做修改
+
+#### 两种路径对比
+
+| | 路径 A：vLLM-HiF8 fork | 路径 B：vLLM 插件 |
+|---|---|---|
+| vLLM 版本 | [XiangWanggithub/vllm](https://github.com/XiangWanggithub/vllm.git) v0.12.0 | 标准 vLLM 0.12.0 |
+| 导出格式 | 模式 3（HiF8 预量化） | 模式 1（BF16）/ 模式 2（uint8） |
+| torch.compile | 支持 | 不支持 |
+| 集成方式 | vLLM 原生 `quant_method` | monkey-patching |
+| 推荐场景 | 生产部署、大模型推理 | 快速验证、标准 vLLM 环境 |
+
+**测试推理**：
+```bash
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -349,19 +412,10 @@ cd custom_ops && python setup_cuda.py build_ext --inplace
 export PYTHONPATH="/path/to/hifp8:/path/to/hifp8/ao:$PYTHONPATH"
 ```
 
-### torch.compile + CUDA Graph 冲突
-
-若使用 HiF8 模式出现 CUDA graph capture 错误，禁用 CUDA graph：
-
-```bash
---compilation-config '{"cudagraph_mode": 0}'
-```
-
-这保持 torch.compile 优化但跳过 CUDA graph 捕获。
-
 ## 参考
 
 - **HiFloat8 论文**: [arxiv 2409.16626](https://arxiv.org/abs/2409.16626)
+- **vLLM-HiF8 fork**: [XiangWanggithub/vllm](https://github.com/XiangWanggithub/vllm.git) (分支 `v0.12.0`，原生支持 HiFloat8)
 - **torchao**: `./ao/` (v0.14.1, 只读)
 - **vLLM**: 0.12.0
 
