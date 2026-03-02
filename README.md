@@ -278,19 +278,19 @@ python -m unittest tests.test_hifp8_flow tests.test_hifp8_uint8_layout tests.tes
 ### 量化流程
 
 ```
-                     训练/校准                          部署
-                   ┌────────────┐                ┌─────────────────┐
-原始模型 (BF16) ──→│ 伪量化      │──→ 导出 ──→    │ vLLM 推理        │
-                   │ float→fp8→float │             │                 │
-                   │ (模拟量化误差)  │              │  BF16: 运行时    │
-                   └────────────┘              │       伪量化       │
-                                                │                 │
-                   ┌────────────┐              │  uint8: 加载时   │
-                   │ uint8 编码   │──→ 导出 ──→  │       解码回BF16  │
-                   │ float→uint8  │             │                 │
-                   │ (HiFloat8 LUT)│             │  HiF8: 预量化   │
-                   └────────────┘              │  torch.compile  │
-                                                └─────────────────┘
+                    训练/校准                              部署
+                  ┌──────────────────┐              ┌──────────────────┐
+原始模型 (BF16) ─→│ 伪量化            │─→ 导出 ─→    │ vLLM 推理         │
+                  │ float→hif8→float │              │                  │
+                  │ (CUDA kernel     │              │ BF16:  运行时     │
+                  │  模拟量化误差)    │              │        伪量化     │
+                  └──────────────────┘              │                  │
+                                                   │ uint8: 加载时     │
+                  ┌──────────────────┐              │        解码回BF16 │
+                  │ uint8 编码        │─→ 导出 ─→    │                  │
+                  │ float→uint8      │              │ HiF8:  预量化     │
+                  │ (HiFloat8 LUT)   │              │        + compile │
+                  └──────────────────┘              └──────────────────┘
 ```
 
 ### HiFloat8 编码格式
@@ -304,28 +304,30 @@ Per-row scaling：每行独立 FP32 scale
 Inf 编码：0x7F (index=127)
 ```
 
-### 单一 Kernel 替换点
+### Kernel 架构与 NPU 适配
 
-当真实 HiFP8 CUDA kernel 就绪时，只需修改一个函数：
+当前实现已包含完整的 HiFloat8 CUDA kernel（`custom_ops/hifloat8_cuda/`），支持 float32/float64/bfloat16 及 CPU fallback。
+
+当 NPU kernel 可用时，只需修改一个函数即可完成替换：
 
 ```python
 # custom_ops/hifp8_ops.py - 唯一需要修改的文件
 def hifp8_fake_quantize(x, param1=0, param2=0, *, granularity, target_dtype):
     scale = compute_hifp8_scale(x, param1, param2, granularity)
-    q = hifp8_cuda_quantize(x, scale, param1, param2)   # ← 你的 CUDA kernel
-    dq = hifp8_cuda_dequantize(q, scale, original_dtype)
+    q = npu_hifp8_quantize(x, scale, param1, param2)     # ← NPU kernel
+    dq = npu_hifp8_dequantize(q, scale, original_dtype)
     return dq
 ```
 
-或通过运行时替换：
+或通过运行时替换（适用于 CUDA/NPU A/B 对比测试）：
 
 ```python
 for module in model.modules():
     if isinstance(module, HiFP8FakeQuantizer):
-        module.set_quantize_fn(my_custom_kernel)
+        module.set_quantize_fn(my_npu_kernel)
 ```
 
-或直接使用 C++ kernel 进行 fake quant（支持 CUDA + CPU，float32/float64/bfloat16）：
+当前 CUDA kernel 可直接调用：
 
 ```python
 from custom_ops.hifp8_uint8_ops import hifp8_fake_quant_direct
