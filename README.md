@@ -5,21 +5,24 @@
 ## 特性
 
 - **双模式量化**：BF16 伪量化（训练/校准） + uint8 真量化（部署/压缩）
+- **HiF8 导出**：为 vLLM-HiF8 fork 导出预量化权重，支持 torch.compile 加速推理
 - **非侵入式设计**：所有代码位于 `./ao/` 外部，torchao 源码只读
 - **vLLM 原生集成**：通过 v4 server 自动检测量化格式，零配置部署
-- **HiFloat8 CUDA 内核**：自定义 8-bit 自适应精度编码/解码
+- **HiFloat8 CUDA 内核**：自定义 8-bit 自适应精度编码/解码，支持 float32/float64/bfloat16 + CPU fallback
 - **Evalscope 评测**：ARC / MMLU / CEval 等标准 benchmark 一键评估
-- **MoE 支持**：验证支持 Qwen3-30B-A3B 等 MoE 架构
+- **MoE 支持**：验证支持 Qwen3-30B-A3B、GPT-OSS-20B 等 MoE 架构
 
 ## 精度评测 (ARC Benchmark)
 
-| 模型 | ARC-Easy | ARC-Challenge | Mean | 模型大小 |
-|------|----------|---------------|------|----------|
-| Qwen3-0.6B (原始) | 0.74 | 0.60 | **0.67** | 1503 MB |
-| + HiFP8 BF16 伪量化 | 0.74 | 0.60 | **0.67** | 1137 MB |
-| + HiFP8 uint8 真量化 | 0.73 | 0.66 | **0.695** | 718 MB (2x 压缩) |
+| 模型 | ARC-Easy | ARC-Challenge | Mean | 备注 |
+|------|----------|---------------|------|------|
+| Qwen3-0.6B (原始) | 0.74 | 0.60 | **0.67** | 100 samples |
+| + HiFP8 BF16 伪量化 | 0.74 | 0.60 | **0.67** | 100 samples |
+| + HiFP8 uint8 真量化 | 0.73 | 0.66 | **0.695** | 100 samples, 2x 压缩 |
+| GPT-OSS-20B HiF8 | 0.9428 | 0.9317 | **0.9391** | 全量评测, torch.compile |
 
-> 100 samples/subset, evalscope 评测, vLLM 推理
+> Qwen3: 100 samples/subset, GPT-OSS: 全量 (ARC-Easy 2376, ARC-Challenge 1172)
+> 全部使用 evalscope 评测, vLLM 推理
 
 ## 目录结构
 
@@ -27,13 +30,14 @@
 hifp8/
 ├── custom_ops/                    # Layer 1: 核心算子
 │   ├── hifp8_ops.py               #   伪量化 kernel（单一替换点）
-│   ├── hifp8_uint8_ops.py         #   uint8 编码/解码 wrapper
+│   ├── hifp8_uint8_ops.py         #   uint8 编码/解码 + direct fake_quant
 │   ├── hifp8_uint8_layout.py      #   torchao Layout 集成
 │   ├── setup_cuda.py              #   CUDA 编译脚本
 │   └── hifloat8_cuda/             #   HiFloat8 CUDA 内核源码
-│       ├── hifloat8_encode_decode.cu
+│       ├── hifloat8_encode_decode.cu  # encode/decode + fake_quant (CUDA/CPU)
 │       ├── hifloat8_lut.h         #   127 值查找表
-│       └── hif8_round.cuh         #   HiFloat8 舍入函数
+│       ├── hif8_round.cuh         #   CUDA 舍入函数
+│       └── hif8_round_cpu.h       #   CPU 舍入函数 (float + double)
 ├── quantization/                  # Layer 2: 量化模块
 │   ├── hifp8_config.py            #   配置类 (BF16/uint8/KV cache)
 │   ├── hifp8_fake_quantizer.py    #   伪量化器（支持运行时 kernel 替换）
@@ -41,6 +45,7 @@ hifp8/
 ├── export/                        # Layer 3: 导出
 │   ├── bf16_export.py             #   统一导出入口 (bf16/uint8)
 │   ├── uint8_export.py            #   uint8 真量化导出
+│   ├── hif8_export.py             #   HiF8 预量化导出 (vLLM-HiF8 fork)
 │   └── vllm_export.py             #   Float8Tensor 导出
 ├── vllm_plugin/                   # Layer 4: vLLM 集成
 │   ├── hifp8_loader.py            #   双模式加载器（自动格式检测）
@@ -50,10 +55,12 @@ hifp8/
 ├── scripts/                       # 工具脚本
 │   ├── start_vllm_hifp8_server_v4.py  # vLLM server（双模式）
 │   ├── eval_arc_comparison.py         # ARC 评测对比脚本
+│   ├── eval_hif8_vllm.py             # HiF8 端到端评测脚本
 │   └── generate_lut.py                # HiFloat8 LUT 生成
 ├── tests/                         # 测试
-│   ├── test_hifp8_flow.py         #   33 个核心测试
-│   └── test_hifp8_uint8_layout.py #   15 个 uint8 layout 测试
+│   ├── test_hifp8_flow.py         #   核心测试 (含 CPU/double/direct fake_quant)
+│   ├── test_hifp8_uint8_layout.py #   uint8 layout 测试
+│   └── test_hifp8_kv_cache.py     #   KV cache 测试
 ├── examples/                      # 示例
 │   ├── quantize_model.py
 │   └── quantize_qwen3.py
@@ -124,6 +131,34 @@ output/qwen3_uint8/
 └── tokenizer files
 ```
 
+### 模式 3：HiF8 预量化导出
+
+为 vLLM-HiF8 fork 导出预量化权重（BF16 fake-quantized + per-channel scale），支持 torch.compile 加速。
+
+```python
+from export.hif8_export import export_for_hif8_vllm
+
+export_for_hif8_vllm(model, tokenizer, "./output/gpt_oss_hif8",
+                      per_channel=True, activation_scheme="dynamic")
+```
+
+**导出产物**：
+```
+output/gpt_oss_hif8/
+├── model.safetensors      # BF16 fake-quantized 权重 + FP32 per-channel scales
+├── config.json            # quantization_config: {"quant_method": "hif8", ...}
+└── tokenizer files
+```
+
+**vLLM-HiF8 推理**：
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model ./output/gpt_oss_hif8 \
+    --tensor-parallel-size 2 \
+    --compilation-config '{"cudagraph_mode": 0}' \
+    --gpu-memory-utilization 0.95
+```
+
 ### vLLM 部署
 
 v4 server 自动检测量化格式（BF16 / uint8 / 无量化）：
@@ -154,6 +189,12 @@ python scripts/eval_arc_comparison.py \
     --gpu 0 \
     --limit 100
 
+# HiF8 端到端评测 (导出 + vLLM server + ARC)
+python scripts/eval_hif8_vllm.py \
+    --model /home/models/gpt-oss-20b-BF16 \
+    --output /home/data/hifp8_eval/gpt_oss_20b_hif8 \
+    --tp 2
+
 # 或手动评测
 evalscope eval \
     --model qwen3-hifp8 \
@@ -165,8 +206,8 @@ evalscope eval \
 ### 运行测试
 
 ```bash
-# 全部 48 个测试
-python -m unittest tests.test_hifp8_flow tests.test_hifp8_uint8_layout -v
+# 全部 78 个测试
+python -m unittest tests.test_hifp8_flow tests.test_hifp8_uint8_layout tests.test_hifp8_kv_cache -v
 ```
 
 ## 技术架构
@@ -184,8 +225,9 @@ python -m unittest tests.test_hifp8_flow tests.test_hifp8_uint8_layout -v
                    ┌────────────┐              │  uint8: 加载时   │
                    │ uint8 编码   │──→ 导出 ──→  │       解码回BF16  │
                    │ float→uint8  │             │                 │
-                   │ (HiFloat8 LUT)│             └─────────────────┘
-                   └────────────┘
+                   │ (HiFloat8 LUT)│             │  HiF8: 预量化   │
+                   └────────────┘              │  torch.compile  │
+                                                └─────────────────┘
 ```
 
 ### HiFloat8 编码格式
@@ -196,6 +238,7 @@ python -m unittest tests.test_hifp8_flow tests.test_hifp8_uint8_layout -v
 127 个正值 + 127 个负值 + 0 + NaN = 256 个编码
 自适应精度：小指数多精度，大指数少精度
 Per-row scaling：每行独立 FP32 scale
+Inf 编码：0x7F (index=127)
 ```
 
 ### 单一 Kernel 替换点
@@ -217,6 +260,14 @@ def hifp8_fake_quantize(x, param1=0, param2=0, *, granularity, target_dtype):
 for module in model.modules():
     if isinstance(module, HiFP8FakeQuantizer):
         module.set_quantize_fn(my_custom_kernel)
+```
+
+或直接使用 C++ kernel 进行 fake quant（支持 CUDA + CPU，float32/float64/bfloat16）：
+
+```python
+from custom_ops.hifp8_uint8_ops import hifp8_fake_quant_direct
+
+output = hifp8_fake_quant_direct(input_tensor)  # 自动选择 CUDA 或 CPU 路径
 ```
 
 ## KV Cache 量化
@@ -243,8 +294,10 @@ export_for_vllm(model, tokenizer, output_dir, kv_cache_config=kv_config)
 |------|------|
 | `prepare_hifp8_fake_quant(model)` | 将 nn.Linear 替换为 HiFP8FakeQuantizedLinear |
 | `export_for_vllm(model, tokenizer, dir, export_mode)` | 统一导出 (bf16/uint8) |
+| `export_for_hif8_vllm(model, tokenizer, dir)` | HiF8 预量化导出 (vLLM-HiF8 fork) |
 | `apply_hifp8_to_vllm_model(model, dir)` | 自动检测格式并加载量化权重 |
 | `hifp8_fake_quantize(x, p1, p2, *, granularity, dtype)` | 核心伪量化（kernel 替换点） |
+| `hifp8_fake_quant_direct(x)` | C++ kernel 直接 fake quant (CUDA/CPU) |
 
 ### 配置类
 
@@ -295,6 +348,16 @@ cd custom_ops && python setup_cuda.py build_ext --inplace
 ```bash
 export PYTHONPATH="/path/to/hifp8:/path/to/hifp8/ao:$PYTHONPATH"
 ```
+
+### torch.compile + CUDA Graph 冲突
+
+若使用 HiF8 模式出现 CUDA graph capture 错误，禁用 CUDA graph：
+
+```bash
+--compilation-config '{"cudagraph_mode": 0}'
+```
+
+这保持 torch.compile 优化但跳过 CUDA graph 捕获。
 
 ## 参考
 

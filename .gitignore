@@ -18,3 +18,7 @@ output/
 
 # OS
 .DS_Store
+
+# Claude Code
+CLAUDE.md
+.claude/
