@@ -12,6 +12,7 @@
 - **vLLM 原生集成**：通过 v4 server 自动检测量化格式，零配置部署
 - **HiFloat8 CUDA 内核**：自定义 8-bit 自适应精度编码/解码，支持 float32/float64/bfloat16 + CPU fallback
 - **Evalscope 评测**：ARC / MMLU / CEval 等标准 benchmark 一键评估
+- **SmoothQuant 集成**：支持 smooth_scale 导出与 vLLM-HiF8 fork 运行时动态应用
 - **MoE 支持**：验证支持 Qwen3-30B-A3B、GPT-OSS-20B 等 MoE 架构
 
 ## 精度评测 (ARC Benchmark)
@@ -25,6 +26,17 @@
 
 > Qwen3: 100 samples/subset, GPT-OSS: 全量 (ARC-Easy 2376, ARC-Challenge 1172)
 > 全部使用 evalscope 评测, vLLM 推理
+
+### GPT-OSS 20B 输出对比 (BF16 vs HiF8)
+
+| Prompt | BF16 | HiF8 | 匹配 |
+|--------|------|------|------|
+| "The Pythagorean theorem states that" | 一致 | 一致 | YES |
+| "Water boils at a temperature of" | 一致 | 一致 | YES |
+| "The capital of France is" | 核心内容一致 | 末尾细微差异 | 近似 |
+| "In machine learning, gradient descent is" | 核心内容一致 | 措辞略有不同 | 近似 |
+
+> 事实性内容完全一致，仅自由续写部分存在预期内的量化微差。
 
 ## 目录结构
 
@@ -58,11 +70,13 @@ hifp8/
 │   ├── start_vllm_hifp8_server_v4.py  # vLLM server（双模式）
 │   ├── eval_arc_comparison.py         # ARC 评测对比脚本
 │   ├── eval_hif8_vllm.py             # HiF8 端到端评测脚本
+│   ├── compare_gpt_oss_outputs.py    # GPT-OSS BF16 vs HiF8 输出对比
 │   └── generate_lut.py                # HiFloat8 LUT 生成
 ├── tests/                         # 测试
 │   ├── test_hifp8_flow.py         #   核心测试 (含 CPU/double/direct fake_quant)
 │   ├── test_hifp8_uint8_layout.py #   uint8 layout 测试
-│   └── test_hifp8_kv_cache.py     #   KV cache 测试
+│   ├── test_hifp8_kv_cache.py     #   KV cache 测试
+│   └── test_smooth_hif8_export.py #   SmoothQuant + HiF8 导出测试
 ├── examples/                      # 示例
 │   ├── quantize_model.py
 │   └── quantize_qwen3.py
@@ -150,9 +164,13 @@ export_for_hif8_vllm(model, tokenizer, "./output/gpt_oss_hif8",
 ```
 output/gpt_oss_hif8/
 ├── model.safetensors      # BF16 fake-quantized 权重 + FP32 per-channel scales
-├── config.json            # quantization_config: {"quant_method": "hif8", ...}
+│                          # + smooth_scale (如启用 SmoothQuant)
+├── config.json            # quantization_config: {"quant_method": "hif8",
+│                          #   "has_smooth_scale": true/false, ...}
 └── tokenizer files
 ```
+
+**SmoothQuant 支持**：若模型经过 `apply_smooth_scale()` 处理，导出时自动包含 `{layer}.smooth_scale` 张量，vLLM-HiF8 fork 运行时在量化前对 activation 执行 `x / smooth_scale`。
 
 > 搭配下文 [路径 A：vLLM-HiF8 fork](#路径-avllm-hif8-fork推荐支持-torchcompile) 部署推理。
 
@@ -173,7 +191,7 @@ cd vllm-hifp8
 VLLM_USE_PRECOMPILED=1 pip install -e .
 ```
 
-**工作原理**：vLLM-HiF8 fork 在 `config.json` 中识别 `quant_method: "hif8"`，加载预量化的 BF16 权重和 per-channel `weight_scale`，运行时仅对 activation 做 fake quant，支持 torch.compile 图模式加速。
+**工作原理**：vLLM-HiF8 fork 在 `config.json` 中识别 `quant_method: "hif8"`，加载预量化的 BF16 权重和 per-channel `weight_scale`，运行时仅对 activation 做 fake quant，支持 torch.compile 图模式加速。当 `has_smooth_scale=true` 时，运行时在量化前自动应用 `x / smooth_scale`。
 
 **搭配导出模式 3（HiF8 预量化导出）使用**：
 ```bash
@@ -255,6 +273,12 @@ python scripts/eval_hif8_vllm.py \
     --output /home/data/hifp8_eval/gpt_oss_20b_hif8 \
     --tp 2
 
+# GPT-OSS BF16 vs HiF8 输出对比
+python scripts/compare_gpt_oss_outputs.py \
+    --bf16-model /home/models/gpt-oss-20b-BF16 \
+    --hif8-model /home/data/hifp8_eval/gpt_oss_20b_hif8 \
+    --tp 2
+
 # 或手动评测
 evalscope eval \
     --model qwen3-hifp8 \
@@ -266,8 +290,8 @@ evalscope eval \
 ### 运行测试
 
 ```bash
-# 全部 78 个测试
-python -m unittest tests.test_hifp8_flow tests.test_hifp8_uint8_layout tests.test_hifp8_kv_cache -v
+# 全部 81 个测试
+python -m unittest tests.test_hifp8_flow tests.test_hifp8_uint8_layout tests.test_hifp8_kv_cache tests.test_smooth_hif8_export -v
 ```
 
 ## 技术架构
@@ -365,6 +389,7 @@ export_for_vllm(model, tokenizer, output_dir, kv_cache_config=kv_config)
 | `apply_hifp8_to_vllm_model(model, dir)` | 自动检测格式并加载量化权重 |
 | `hifp8_fake_quantize(x, p1, p2, *, granularity, dtype)` | 核心伪量化（kernel 替换点） |
 | `hifp8_fake_quant_direct(x)` | C++ kernel 直接 fake quant (CUDA/CPU) |
+| `apply_smooth_scale(model, scales)` | 应用 SmoothQuant scale 到模型 |
 
 ### 配置类
 
@@ -415,6 +440,16 @@ cd custom_ops && python setup_cuda.py build_ext --inplace
 ```bash
 export PYTHONPATH="/path/to/hifp8:/path/to/hifp8/ao:$PYTHONPATH"
 ```
+
+## TODO
+
+- [ ] **SmoothQuant scale fusion**：将 `1/smooth_scale` 融合到前置层权重中，消除运行时除法开销
+  - `q_proj/k_proj/v_proj` ← 融合到 `input_layernorm.weight`
+  - `o_proj` ← 融合到 `v_proj` 权重
+  - `gate_proj/up_proj` ← 融合到 `post_attention_layernorm.weight`
+  - `down_proj` ← 融合到 `up_proj` 权重
+- [ ] **vLLM-HiF8 fork 远程推送**：本地已提交 (747f17fe6)，需解决 HTTPS 认证后推送
+- [ ] **更多模型验证**：在更多模型上验证 SmoothQuant + HiF8 端到端精度
 
 ## 参考
 
