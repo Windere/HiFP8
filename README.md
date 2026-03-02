@@ -1,6 +1,8 @@
 # HiFP8 — HiFloat8 量化框架
 
-基于 [HiFloat8 (arxiv 2409.16626)](https://arxiv.org/abs/2409.16626) 的量化实现，支持 **BF16 伪量化** 和 **uint8 真量化** 双模式，无需修改 torchao 源码，可直接通过 vLLM 部署推理。
+基于 [HiFloat8 (arxiv 2409.16626)](https://arxiv.org/abs/2409.16626) 的量化实现，支持 **BF16 伪量化** 和 **uint8 真量化** 双模式，无需修改 torchao 源码，可通过 vLLM 部署推理。
+
+> **术语说明**：**HiFloat8** 是论文定义的 8-bit 自适应浮点格式；**HiFP8** 是本项目名称；**HiF8** 是 vLLM fork 中的 `quant_method` 标识。
 
 ## 特性
 
@@ -29,7 +31,7 @@
 ```
 hifp8/
 ├── custom_ops/                    # Layer 1: 核心算子
-│   ├── hifp8_ops.py               #   伪量化 kernel（单一替换点）
+│   ├── hifp8_ops.py               #   伪量化 kernel（NPU 适配替换点）
 │   ├── hifp8_uint8_ops.py         #   uint8 编码/解码 + direct fake_quant
 │   ├── hifp8_uint8_layout.py      #   torchao Layout 集成
 │   ├── setup_cuda.py              #   CUDA 编译脚本
@@ -75,25 +77,27 @@ hifp8/
 # 设置 PYTHONPATH
 export PYTHONPATH="$(pwd):$(pwd)/ao:$PYTHONPATH"
 
-# 编译 HiFloat8 CUDA 内核（uint8 真量化需要）
+# 编译 HiFloat8 CUDA 内核（uint8 真量化、direct fake_quant 需要）
 cd custom_ops && python setup_cuda.py build_ext --inplace && cd ..
 ```
 
-**依赖**：Python >= 3.10, PyTorch >= 2.0 (CUDA), vLLM 0.12.0, safetensors
+**依赖**：Python >= 3.10, PyTorch >= 2.0 (CUDA), safetensors, transformers
+**部署依赖**（可选）：vLLM 0.12.0（标准版或 [HiF8 fork](https://github.com/XiangWanggithub/vllm.git)）, evalscope
 
 ### 模式 1：BF16 伪量化
 
 训练/校准阶段使用，在 BF16 精度下模拟量化误差。
 
 ```python
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from quantization.hifp8_linear import prepare_hifp8_fake_quant
 from export.bf16_export import export_for_vllm
 
 # 1. 加载模型
-model = AutoModelForCausalLM.from_pretrained("/home/models/Qwen3-0.6B",
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B",
                                               torch_dtype=torch.bfloat16, device_map="cuda")
-tokenizer = AutoTokenizer.from_pretrained("/home/models/Qwen3-0.6B")
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 
 # 2. 应用伪量化
 prepare_hifp8_fake_quant(model)
@@ -150,14 +154,7 @@ output/gpt_oss_hif8/
 └── tokenizer files
 ```
 
-**vLLM-HiF8 推理**：
-```bash
-python -m vllm.entrypoints.openai.api_server \
-    --model ./output/gpt_oss_hif8 \
-    --tensor-parallel-size 2 \
-    --compilation-config '{"cudagraph_mode": 0}' \
-    --gpu-memory-utilization 0.95
-```
+> 搭配下文 [路径 A：vLLM-HiF8 fork](#路径-avllm-hif8-fork推荐支持-torchcompile) 部署推理。
 
 ### vLLM 部署
 
@@ -278,19 +275,25 @@ python -m unittest tests.test_hifp8_flow tests.test_hifp8_uint8_layout tests.tes
 ### 量化流程
 
 ```
-                    训练/校准                              部署
-                  ┌──────────────────┐              ┌──────────────────┐
-原始模型 (BF16) ─→│ 伪量化            │─→ 导出 ─→    │ vLLM 推理         │
-                  │ float→hif8→float │              │                  │
-                  │ (CUDA kernel     │              │ BF16:  运行时     │
-                  │  模拟量化误差)    │              │        伪量化     │
-                  └──────────────────┘              │                  │
-                                                   │ uint8: 加载时     │
-                  ┌──────────────────┐              │        解码回BF16 │
-                  │ uint8 编码        │─→ 导出 ─→    │                  │
-                  │ float→uint8      │              │ HiF8:  预量化     │
-                  │ (HiFloat8 LUT)   │              │        + compile │
-                  └──────────────────┘              └──────────────────┘
+                    量化/导出                                 部署
+
+                  ┌──────────────────┐    模式 1    ┌──────────────────────┐
+                  │ BF16 伪量化       │───────────→  │ vLLM 插件 (路径 B)    │
+                  │ float→hif8→float │              │ 运行时 fake quant     │
+                  │ (CUDA kernel)    │              └──────────────────────┘
+                  └──────────────────┘
+原始模型 (BF16) ─→                                  ┌──────────────────────┐
+                  ┌──────────────────┐    模式 2    │ vLLM 插件 (路径 B)    │
+                  │ uint8 编码        │───────────→  │ 加载时解码回 BF16     │
+                  │ float→uint8      │              └──────────────────────┘
+                  │ (HiFloat8 LUT)   │
+                  └──────────────────┘              ┌──────────────────────┐
+                                          模式 3    │ vLLM-HiF8 fork(路径A)│
+                  ┌──────────────────┐              │ 预量化权重            │
+                  │ HiF8 预量化导出   │───────────→  │ + torch.compile      │
+                  │ fake_quant→BF16  │              └──────────────────────┘
+                  │ + per-ch scale   │
+                  └──────────────────┘
 ```
 
 ### HiFloat8 编码格式
