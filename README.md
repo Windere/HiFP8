@@ -7,7 +7,7 @@
 ## 特性
 
 - **双模式量化**：BF16 伪量化（训练/校准） + uint8 真量化（部署/压缩）
-- **HiF8 导出**：为 vLLM-HiF8 fork 导出预量化权重，支持 torch.compile 加速推理
+- **HiF8 导出**：为 [vLLM-HiF8 fork](https://github.com/XiangWanggithub/vllm.git) 导出预量化权重，支持 torch.compile 加速推理
 - **非侵入式设计**：所有代码位于 `./ao/` 外部，torchao 源码只读
 - **vLLM 原生集成**：通过 v4 server 自动检测量化格式，零配置部署
 - **HiFloat8 CUDA 内核**：自定义 8-bit 自适应精度编码/解码，支持 float32/float64/bfloat16 + CPU fallback
