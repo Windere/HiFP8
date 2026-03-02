@@ -79,10 +79,12 @@ def export_for_hif8_vllm(
     _skip_names = ("embed_tokens", "lm_head")
     linear_weight_names = set()
     for name, module in model.named_modules():
-        if isinstance(module, (HiFP8FakeQuantizedLinear, nn.Linear)):
-            if isinstance(module, nn.Linear) and len(list(module.children())) == 0:
-                if not any(s in name for s in _skip_names):
-                    linear_weight_names.add(f"{name}.weight")
+        if isinstance(module, HiFP8FakeQuantizedLinear):
+            if not any(s in name for s in _skip_names):
+                linear_weight_names.add(f"{name}.weight")
+        elif isinstance(module, nn.Linear) and len(list(module.children())) == 0:
+            if not any(s in name for s in _skip_names):
+                linear_weight_names.add(f"{name}.weight")
 
     # Also identify 3D+ weight tensors (MoE fused expert weights)
     expert_weight_names = set()
@@ -98,6 +100,16 @@ def export_for_hif8_vllm(
     if expert_weight_names:
         print(f"[HiF8 Export] Found {len(expert_weight_names)} fused expert weight tensors")
     print(f"[HiF8 Export] {len(all_quant_names)} weight tensors to fake-quantize")
+
+    # Step 1.5: Collect SmoothQuant scales for export
+    # SmoothQuant applies: W_smooth = W * diag(s), forward: x_new = x / s
+    # Export smooth_scale so vLLM-HiF8 fork can apply x / s at runtime
+    smooth_scales = {}
+    for name, module in model.named_modules():
+        if isinstance(module, HiFP8FakeQuantizedLinear) and module.smooth_scale is not None:
+            smooth_scales[name] = module.smooth_scale.detach().cpu().float()
+    if smooth_scales:
+        print(f"[HiF8 Export] Found {len(smooth_scales)} layers with SmoothQuant scales")
 
     # Step 2: Build state_dict with fake-quantized weights + per-channel scales
     state_dict = {}
@@ -150,10 +162,15 @@ def export_for_hif8_vllm(
             # Non-quantizable params: save as-is
             state_dict[param_name] = param.data.cpu()
 
-    # Also save buffers (layer norms, etc.)
+    # Also save buffers (layer norms, etc.), excluding smooth_scale buffers
+    # (smooth_scale is handled separately below)
     for buf_name, buf in model.named_buffers():
-        if buf_name not in state_dict:
+        if buf_name not in state_dict and not buf_name.endswith(".smooth_scale"):
             state_dict[buf_name] = buf.cpu()
+
+    # Save SmoothQuant scales as {layer}.smooth_scale
+    for layer_name, smooth_scale in smooth_scales.items():
+        state_dict[f"{layer_name}.smooth_scale"] = smooth_scale
 
     torch.cuda.empty_cache()
     print(f"[HiF8 Export] Fake-quantized {scale_count} weight tensors")
@@ -178,6 +195,7 @@ def export_for_hif8_vllm(
         "quant_method": "hif8",
         "activation_scheme": activation_scheme,
         "per_channel": per_channel,
+        "has_smooth_scale": len(smooth_scales) > 0,
     }
 
     with open(config_path, "w") as f:
