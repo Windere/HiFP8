@@ -104,12 +104,73 @@ def export_for_hif8_vllm(
     # Step 1.5: Collect SmoothQuant scales for export
     # SmoothQuant applies: W_smooth = W * diag(s), forward: x_new = x / s
     # Export smooth_scale so vLLM-HiF8 fork can apply x / s at runtime
+    # Skip embed_tokens/lm_head — dividing their activations by smooth_scale
+    # would destroy embedding lookup / logit distribution.
     smooth_scales = {}
     for name, module in model.named_modules():
         if isinstance(module, HiFP8FakeQuantizedLinear) and module.smooth_scale is not None:
+            if any(s in name for s in _skip_names):
+                continue
             smooth_scales[name] = module.smooth_scale.detach().cpu().float()
     if smooth_scales:
         print(f"[HiF8 Export] Found {len(smooth_scales)} layers with SmoothQuant scales")
+
+    # Step 1.6: Merge smooth_scales for vLLM merged layers
+    # vLLM merges: q_proj+k_proj+v_proj → qkv_proj, gate_proj+up_proj → gate_up_proj
+    # Each merged layer gets ONE smooth_scale, so sub-layers must agree.
+    # Strategy: element-wise max across sub-layers, then adjust weights to compensate.
+    _merge_groups = {
+        "self_attn": ["q_proj", "k_proj", "v_proj"],
+        "mlp": ["gate_proj", "up_proj"],
+    }
+    smooth_scale_adjustments = {}  # layer_name → ratio tensor (s_merged / s_original)
+
+    if smooth_scales:
+        # Group smooth_scales by parent layer (e.g., "model.layers.0.self_attn")
+        from collections import defaultdict
+        parent_groups = defaultdict(dict)
+        for layer_name in smooth_scales:
+            for parent_suffix, sub_names in _merge_groups.items():
+                for sub_name in sub_names:
+                    if layer_name.endswith(f".{parent_suffix}.{sub_name}"):
+                        parent = layer_name[: layer_name.rfind(f".{sub_name}")]
+                        parent_groups[parent][sub_name] = layer_name
+                        break
+
+        merge_count = 0
+        for parent, sub_map in parent_groups.items():
+            # Determine which merge group this parent belongs to
+            group_sub_names = None
+            for parent_suffix, sub_names in _merge_groups.items():
+                if parent.endswith(f".{parent_suffix}"):
+                    group_sub_names = sub_names
+                    break
+            if group_sub_names is None:
+                continue
+
+            # Only merge if we have at least 2 sub-layers with smooth_scale
+            present = [sn for sn in group_sub_names if sn in sub_map]
+            if len(present) < 2:
+                continue
+
+            # Compute element-wise max across all sub-layers
+            scales = [smooth_scales[sub_map[sn]] for sn in present]
+            s_merged = scales[0].clone()
+            for s in scales[1:]:
+                s_merged = torch.max(s_merged, s)
+
+            # Update smooth_scales and compute adjustment ratios
+            for sn in present:
+                layer_name = sub_map[sn]
+                s_original = smooth_scales[layer_name]
+                ratio = s_merged / s_original  # >= 1.0 everywhere
+                smooth_scale_adjustments[layer_name] = ratio
+                smooth_scales[layer_name] = s_merged.clone()
+            merge_count += 1
+
+        if merge_count > 0:
+            print(f"[HiF8 Export] Merged smooth_scales for {merge_count} layer groups "
+                  f"(max-based unification for vLLM merged layers)")
 
     # Step 2: Build state_dict with fake-quantized weights + per-channel scales
     state_dict = {}
@@ -125,6 +186,16 @@ def export_for_hif8_vllm(
                 w_2d = w.reshape(-1, w.shape[-1]).cuda()
             else:
                 w_2d = w.cuda()
+
+            # Apply merged smooth_scale adjustment if needed
+            # For merged layers (q/k/v, gate/up), the weight already has s_original
+            # baked in. Multiply by (s_merged / s_original) to make it consistent
+            # with the unified smooth_scale that vLLM will use at runtime.
+            layer_name = param_name.replace(".weight", "")
+            if layer_name in smooth_scale_adjustments:
+                ratio = smooth_scale_adjustments[layer_name].cuda()
+                # ratio shape [in_features], weight shape [out, in] → scale columns
+                w_2d = w_2d * ratio.unsqueeze(0)
 
             # Fake quantize: clamp → HiFloat8 LUT roundtrip → BF16
             # This matches the runtime behavior of scaled_hif8_quant(weight, scale=None, use_wmax=False)
