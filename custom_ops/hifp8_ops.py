@@ -15,13 +15,16 @@ from typing import Optional, Tuple
 
 import torch
 
-from torchao.quantization.quant_primitives import (
-    _choose_scale_float8,
-    _dequantize_affine_float8,
-    _quantize_affine_float8,
-)
-from torchao.quantization.granularity import PerRow
-from torchao.quantization.utils import get_block_size
+try:
+    from torchao.quantization.quant_primitives import (
+        _choose_scale_float8,
+        _dequantize_affine_float8,
+        _quantize_affine_float8,
+    )
+    from torchao.quantization.granularity import PerRow
+    from torchao.quantization.utils import get_block_size
+except ImportError:
+    pass  # torchao only needed for FP8 e4m3 fallback path
 
 logger = logging.getLogger(__name__)
 

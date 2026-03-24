@@ -7,6 +7,7 @@ This module provides patchers that work with vLLM 0.12.0's actual architecture:
 """
 
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -121,6 +122,21 @@ def _patch_qkv_parallel_linear(
         from custom_ops import hifp8_fake_quantize
         from torchao.quantization.granularity import PerRow
 
+        # Scale mode: "unit" (scale=1), "amax" (default), "optimal" (split sf)
+        scale_mode = os.environ.get("HIFP8_SCALE_MODE", "amax")
+
+        act_kw = {}
+        w_kw = {}
+        if scale_mode == "unit":
+            act_kw["static_scale"] = torch.ones(1, device=hidden_states.device, dtype=torch.float32)
+            w_kw["static_scale"] = torch.ones(1, device=hidden_states.device, dtype=torch.float32)
+        elif scale_mode == "optimal":
+            # Weight: scale=amax/8, activation: scale=amax/4
+            w_sf = float(os.environ.get("HIFP8_W_SF", "8"))
+            a_sf = float(os.environ.get("HIFP8_A_SF", "4"))
+            w_kw["scale_factor"] = w_sf
+            act_kw["scale_factor"] = a_sf
+
         # Fake quantize input activation
         hidden_states_q = hifp8_fake_quantize(
             hidden_states,
@@ -128,6 +144,7 @@ def _patch_qkv_parallel_linear(
             0,
             granularity=PerRow(),
             target_dtype=torch.float8_e4m3fn,
+            **act_kw,
         )
 
         # Fake quantize weight (entire fused QKV weight)
@@ -139,7 +156,8 @@ def _patch_qkv_parallel_linear(
             weight = module.weight.data
 
         weight_q = hifp8_fake_quantize(
-            weight, 0, 0, granularity=PerRow(), target_dtype=torch.float8_e4m3fn
+            weight, 0, 0, granularity=PerRow(), target_dtype=torch.float8_e4m3fn,
+            **w_kw,
         )
 
         # Temporarily replace weight with quantized version
@@ -167,12 +185,20 @@ def _patch_row_parallel_linear(module: nn.Module, name: str, metadata: dict) -> 
         from custom_ops import hifp8_fake_quantize
         from torchao.quantization.granularity import PerRow
 
-        # Fake quantize input
+        scale_mode = os.environ.get("HIFP8_SCALE_MODE", "amax")
+        act_kw, w_kw = {}, {}
+        if scale_mode == "unit":
+            act_kw["static_scale"] = torch.ones(1, device=input_.device, dtype=torch.float32)
+            w_kw["static_scale"] = torch.ones(1, device=input_.device, dtype=torch.float32)
+        elif scale_mode == "optimal":
+            w_kw["scale_factor"] = float(os.environ.get("HIFP8_W_SF", "8"))
+            act_kw["scale_factor"] = float(os.environ.get("HIFP8_A_SF", "4"))
+
         input_q = hifp8_fake_quantize(
-            input_, 0, 0, granularity=PerRow(), target_dtype=torch.float8_e4m3fn
+            input_, 0, 0, granularity=PerRow(), target_dtype=torch.float8_e4m3fn,
+            **act_kw,
         )
 
-        # Fake quantize weight
         if hasattr(module, "_original_weight"):
             weight = module._original_weight
         else:
@@ -180,14 +206,13 @@ def _patch_row_parallel_linear(module: nn.Module, name: str, metadata: dict) -> 
             weight = module.weight.data
 
         weight_q = hifp8_fake_quantize(
-            weight, 0, 0, granularity=PerRow(), target_dtype=torch.float8_e4m3fn
+            weight, 0, 0, granularity=PerRow(), target_dtype=torch.float8_e4m3fn,
+            **w_kw,
         )
 
         original_weight = module.weight.data
         module.weight.data = weight_q
-
         output = original_forward(input_q)
-
         module.weight.data = original_weight
         return output
 
@@ -205,8 +230,18 @@ def _patch_column_parallel_linear(
         from custom_ops import hifp8_fake_quantize
         from torchao.quantization.granularity import PerRow
 
+        scale_mode = os.environ.get("HIFP8_SCALE_MODE", "amax")
+        act_kw, w_kw = {}, {}
+        if scale_mode == "unit":
+            act_kw["static_scale"] = torch.ones(1, device=input_.device, dtype=torch.float32)
+            w_kw["static_scale"] = torch.ones(1, device=input_.device, dtype=torch.float32)
+        elif scale_mode == "optimal":
+            w_kw["scale_factor"] = float(os.environ.get("HIFP8_W_SF", "8"))
+            act_kw["scale_factor"] = float(os.environ.get("HIFP8_A_SF", "4"))
+
         input_q = hifp8_fake_quantize(
-            input_, 0, 0, granularity=PerRow(), target_dtype=torch.float8_e4m3fn
+            input_, 0, 0, granularity=PerRow(), target_dtype=torch.float8_e4m3fn,
+            **act_kw,
         )
 
         if hasattr(module, "_original_weight"):
@@ -216,14 +251,13 @@ def _patch_column_parallel_linear(
             weight = module.weight.data
 
         weight_q = hifp8_fake_quantize(
-            weight, 0, 0, granularity=PerRow(), target_dtype=torch.float8_e4m3fn
+            weight, 0, 0, granularity=PerRow(), target_dtype=torch.float8_e4m3fn,
+            **w_kw,
         )
 
         original_weight = module.weight.data
         module.weight.data = weight_q
-
         output = original_forward(input_q)
-
         module.weight.data = original_weight
         return output
 

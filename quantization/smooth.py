@@ -93,6 +93,8 @@ def calibrate_and_smooth(
     dataloader,
     alpha: float = 0.5,
     num_batches: int = 32,
+    skip_layers: tuple = ("embed_tokens", "lm_head"),
+    max_scale: Optional[float] = None,
 ) -> dict:
     """
     One-stop SmoothQuant calibration: collect activation stats and compute scales.
@@ -108,6 +110,15 @@ def calibrate_and_smooth(
         dataloader: Calibration data loader.
         alpha: SmoothQuant alpha parameter (0-1). Default: 0.5.
         num_batches: Number of batches to use for calibration. Default: 32.
+        skip_layers: Layer name substrings to skip (e.g., embed_tokens, lm_head).
+                     SmoothQuant should not be applied to these layers because
+                     the weight modification (W * s) cannot be compensated at
+                     runtime without an exported smooth_scale, which would break
+                     embeddings and logit distributions.
+        max_scale: If set, clamp smooth_scale to [1/max_scale, max_scale].
+                   Prevents extreme scales from amplifying quantization error,
+                   especially important for small models where per-channel
+                   weight magnitudes are small (w_max << 1).
 
     Returns:
         Dict mapping layer FQN to computed smooth scale tensor.
@@ -139,11 +150,17 @@ def calibrate_and_smooth(
 
         return hook
 
-    # Register hooks
+    # Register hooks — skip embed_tokens/lm_head
+    skipped = []
     for name, module in model.named_modules():
         if isinstance(module, HiFP8FakeQuantizedLinear):
+            if any(s in name for s in skip_layers):
+                skipped.append(name)
+                continue
             hook_handle = module.register_forward_pre_hook(make_hook(name))
             hooks.append(hook_handle)
+    if skipped:
+        print(f"[SmoothQuant] Skipping {len(skipped)} layers: {skipped}")
 
     # Step 2: Run calibration batches
     print(f"[SmoothQuant] Collecting activation statistics over {num_batches} batches...")
@@ -183,7 +200,14 @@ def calibrate_and_smooth(
 
         x_abs_max = activation_stats[name]
         scale = compute_smooth_scale(x_abs_max, module.weight.data, alpha)
+
+        if max_scale is not None:
+            scale = torch.clamp(scale, min=1.0 / max_scale, max=max_scale)
+
         smooth_scales[name] = scale
+
+    if max_scale is not None:
+        print(f"[SmoothQuant] Scale clipping: max_scale={max_scale}")
 
     # Step 4: Apply scales to model
     print(f"[SmoothQuant] Applying smooth scales (alpha={alpha})...")

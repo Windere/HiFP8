@@ -54,6 +54,8 @@ def main():
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--smooth-alpha", type=float, default=0.5)
+    parser.add_argument("--max-scale", type=float, default=None,
+                        help="Clamp smooth_scale to [1/max_scale, max_scale]")
     parser.add_argument("--calibration-batches", type=int, default=32)
     parser.add_argument("--max-length", type=int, default=512)
     args = parser.parse_args()
@@ -91,7 +93,7 @@ def main():
     print(f"  Prepared {len(dataloader)} calibration samples")
     smooth_scales = calibrate_and_smooth(
         model, dataloader, alpha=args.smooth_alpha,
-        num_batches=len(dataloader),
+        num_batches=len(dataloader), max_scale=args.max_scale,
     )
     print(f"  Applied SmoothQuant to {len(smooth_scales)} layers")
 
