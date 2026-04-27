@@ -1,0 +1,7 @@
+{
+  "gsm8k": 0.37,
+  "main": 0.37,
+  "arc": 0.55,
+  "arc-easy": 0.645,
+  "arc-challenge": 0.455
+}

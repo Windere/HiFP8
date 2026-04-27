@@ -294,6 +294,134 @@ evalscope eval \
 python -m unittest tests.test_hifp8_flow tests.test_hifp8_uint8_layout tests.test_hifp8_kv_cache tests.test_smooth_hif8_export -v
 ```
 
+## 远程服务器复现 + Kernel 验证
+
+本节给出在干净的远程服务器上从零复现"**kernel 正确性 + 时延 + QAT/SmoothQuant 实验**"的最短路径。除了 GPU 驱动外不假设任何已装包。
+
+### 一键 env 引导
+
+```bash
+# 0. clone + cd
+git clone https://github.com/Windere/HiFP8.git && cd HiFP8
+
+# 1. 创建 conda 环境 hifp8-eval（python 3.12 + torch 2.9.0+cu128 + transformers
+#    + datasets + evalscope + en-dtypes + pytest），编译 HiFP8 CUDA kernel，
+#    并安装/复用 vLLM XiangWanggithub fork。脚本是幂等的，可反复运行。
+bash setup_env_hifp8_eval.sh
+
+# 2. 激活
+source ~/miniconda3/etc/profile.d/conda.sh && conda activate hifp8-eval
+```
+
+完成后 `outputs/.phase_1_done` 会落盘标记 phase 1 完成。详细日志在 `outputs/logs/setup.log`。
+
+### Kernel 调用示例
+
+CUDA encode/decode 对 float32 张量：
+
+```python
+import sys, torch
+sys.path.insert(0, "custom_ops")
+import hifp8_cuda_uint8 as h
+
+x = torch.randn(4, 1024, device="cuda", dtype=torch.float32)
+
+# 默认布局：LUT-rank（本仓库的 byte 编码方式，bit pattern = 排序索引）
+enc_lr = h.hif8_encode_cuda(x.contiguous())                    # uint8 [4, 1024]
+dec_lr = h.hif8_decode_cuda(enc_lr)                            # float32 [4, 1024]
+
+# Ascend / en-dtypes 兼容布局（bit pattern 与 Ascend NPU、en-dtypes 完全一致）
+enc_as = h.hif8_encode_ascend_cuda(x.contiguous())             # uint8 [4, 1024]
+dec_as = h.hif8_decode_ascend_cuda(enc_as)                     # float32 [4, 1024]
+
+# 高速分支：4 KB 查表无分支编码（~2× 于上方 math 路径）
+enc_fast_lr = h.hif8_encode_lut_only_cuda(x.contiguous())      # LUT-rank
+enc_fast_as = h.hif8_encode_ascend_lut_only_cuda(x.contiguous())  # Ascend
+
+# 直接 fake-quant（input dtype = output dtype，不经 uint8）
+from custom_ops.hifp8_uint8_ops import hifp8_fake_quant_direct
+y = hifp8_fake_quant_direct(x)                                 # float32 → float32
+```
+
+NaN/±Inf 在两种布局下都按 IEEE 语义保留（NaN→0x80，±Inf→0x7F/0xFF 在 LUT-rank，0x6F/0xEF 在 Ascend）。
+
+### 与 en-dtypes 的精度 + 时延对比
+
+仓库提供 4 个互补 verifier：
+
+| 脚本 | 内容 | 运行时长 |
+|------|------|---------|
+| `verify_hifp8_vs_endtypes.py` | Python 端**舍入算法**与 en-dtypes 的逐元素对比 (1.1M 样本) | ~5 s |
+| `verify_hifp8_cuda_vs_endtypes.py` | **真实 CUDA kernel** 与 en-dtypes round-trip 对比 (1.1M 样本) | ~3 s |
+| `verify_ascend_format.py` | Ascend byte 布局与 en-dtypes 逐字节相同（1M+256 byte 全枚举） | ~2 s |
+| `verify_lut_only_encode.py` | 4 KB-LUT 无分支 encode 与 math 路径 byte-byte 等价（800 K 样本） + 微基准 | ~10 s |
+| **`bench_hifp8_vs_endtypes.py`** | **Head-to-head**：精度对比 + 时延对比（en-dtypes CPU vs CUDA 4 路径） | ~30 s |
+
+最重要的一个：
+
+```bash
+python bench_hifp8_vs_endtypes.py
+```
+
+样例输出（RTX 5090, sm_120, torch 2.9.0+cu128, en-dtypes 0.0.4，输入 5×10⁷ float32）：
+
+```
+Part A — accuracy
+  [A.1] Encode byte equality (Ascend layout, n=1,000,000)   mismatches = 0/1000000  → OK
+  [A.2] Decode equality (all 256 byte patterns)             mismatches = 0/256      → OK
+
+Part B — latency  (50 M float32 samples)
+  path                                        ms/run    G-elems/s
+  --------------------------------------  ----------  -----------
+  en-dtypes CPU astype                        493.35        0.101
+  CUDA  LUT-rank  (math + binsearch)           0.446       112.20
+  CUDA  Ascend    (math + binsearch + remap)   0.547        91.37
+  CUDA  Ascend    (LUT-only, branchless)       0.247       202.22
+  CUDA  LUT-rank  (LUT-only, branchless)       0.248       201.98
+
+  Speedup vs en-dtypes CPU (best CUDA path):
+    1995× faster   (493 ms → 0.25 ms)
+```
+
+数字解读：
+- **精度 100% 对齐**：1M 个 log-uniform 横跨整个 HiFloat8 动态范围 [2⁻²⁵, 2¹⁷] 的样本，加 256 个 byte pattern 的 decode 全枚举，**全部 0 mismatch**。包括 NaN/±Inf 语义。
+- **时延**：en-dtypes 是单线程 numpy，CUDA 是 RTX 5090 上的 batch encode。**LUT-only 分支** (4 KB constant memory + 1 次查表 + 1 次 sign OR) 比 en-dtypes 快约 **1995×**。
+- **Math 路径 vs LUT-only**：约 **1.8-2.2×** 差距。LUT-only 通过 `(exp[8] | top_4_mantissa[4])` 索引 4096-entry constant 表完全消除 `hif8_round_float` + 二分查找，是 round-half-away-from-zero 在数学上不需要 sticky bit 的等价转换（详见 `quantization/smooth_fuse.py` 与 `custom_ops/hifloat8_cuda/hifloat8_encode_lut.h` 的 docstring）。
+
+### 复现 QAT + SmoothQuant 端到端实验
+
+```bash
+# 全 pipeline（5 phases，~75 min total on single RTX 5090, ~30 GB VRAM 峰值）
+bash scripts/run_pipeline.sh
+
+# 或单步执行（每个 phase 完成后写 outputs/.phase_N_done sentinel；
+# 重跑某个 phase 用 --from N，例如只重跑 phase 5 评测：
+bash scripts/run_pipeline.sh --from 5
+```
+
+各 phase 的角色：
+
+| Phase | 脚本 | 产物 | 时长 |
+|---|---|---|---|
+| 1 | `setup_env_hifp8_eval.sh` | conda env + CUDA kernel build + vLLM fork install | ~10 min |
+| 2 | `pytest tests/test_hifp8_ste.py -v` | STE wrapper 5 个单测 | <1 min |
+| 3 | `python scripts/quantize_qwen3_ptq_smooth_fused.py` | `outputs/qwen3_ptq_smooth_fused/`，**naive SmoothQuant + fold-into-RMSNorm** plain BF16 ckpt（任何 inference 框架可直接 serve） | ~5 min |
+| 4 | `python examples/qat_qwen3_demo.py` | `outputs/qwen3_qat/`，2000 步 KL 蒸馏 QAT | ~35 min |
+| 5 | `python scripts/eval_three_way.py` | `outputs/REPORT.md`，BF16/PTQ/PTQ+Smooth/QAT 4 档 evalscope 对比（ARC + GSM8K，每 subset 200 题） | ~40 min |
+
+### 关键设计 / 实验记录
+
+- **STE wrapper** (`quantization/hifp8_ste.py`)：把 CUDA encode→decode 包成 `torch.autograd.Function`，前向走真实量化、反向走 clipped Straight-Through Estimator（值在 HIF8_MAX × scale_factor 之外的位置 grad 置零，防优化器把权重推得越界）。开 QAT 用 `HiFP8FakeQuantizeConfig(qat=True)`。
+- **Fold-into-RMSNorm** (`quantization/smooth_fuse.py`)：SmoothQuant 论文 §4 的标准做法。q/k/v 共享 `input_layernorm`、gate/up 共享 `post_attention_layernorm`，sibling scales **max-unify** 后吸收进 norm.weight。`o_proj`/`down_proj` 因前驱不是 norm，默认走 rollback 路径（不 smooth）。
+- **Cross-layer fold（实验性）**：`o_proj→V_proj` + `down_proj→up_proj` 也是数学等价的 fold，通过 `--full-fold` flag 启用。**对 HiFP8 per-row 权重量化反而退步**（见 `outputs/REPORT.md` Appendix A 的根因分析），因此默认关闭。
+- **零运行时依赖**：`outputs/qwen3_ptq_smooth_fused/` 是 plain BF16 + plain `nn.Linear`，没有 `quantization_config`、没有 smooth_scale buffer、没有任何 fork-specific 字段。stock vLLM / transformers / TGI / SGLang 都能直接加载。
+
+### 故障排查
+
+- **`Skipping import of cpp extensions due to incompatible torch version`**：torchao 要求 torch ≥ 2.11，但 vLLM fork 锁 torch 2.9。这是 torchao 自检告警，**不影响功能**——HiFP8 kernel 通过自家 `custom_ops/setup_cuda.py` 编译，不走 torchao cpp ext 路径。
+- **vLLM server 600 s 起不来**：通常是 tokenizer_config.json 的 `extra_special_tokens` 字段是 list（transformers 5.x 写出格式）但 vLLM 配的 transformers 4.x 期待 dict。`scripts/quantize_qwen3_ptq_smooth_fused.py` 在 save 后自动 patch 该字段；如果是其他 ckpt，把 list 替换成 `{}` 即可。
+- **`KeyError: 'layers.0.mlp.down_proj.smooth_scale'`** （vLLM fork 的 `online_quantization` 路径）：意味着 ckpt 走了 fork 的 smooth_scale runtime apply 分支但 buffer 名不匹配。**默认的 fold ckpt 不会触发**（plain BF16，无 buffer）；只有用 `export_for_hif8_vllm()` 导出才走 fork 路径，注意它依赖 fork 内部的 buffer naming 约定。
+
 ## 技术架构
 
 ### 量化流程

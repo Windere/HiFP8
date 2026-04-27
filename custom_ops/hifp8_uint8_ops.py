@@ -198,3 +198,132 @@ def hifp8_fake_quant_direct(x: torch.Tensor) -> torch.Tensor:
     if not HAS_CUDA_KERNELS:
         raise RuntimeError("HiFloat8 CUDA kernels not available")
     return hif8_cuda.fake_quant(x.contiguous())
+
+
+# ---------------------------------------------------------------------------
+# Ascend / en-dtypes hardware-compatible byte layout
+# ---------------------------------------------------------------------------
+#
+# The default kernel emits a "LUT-rank" byte layout that is convenient for
+# the in-process round-trip but not what real Ascend NPUs read. Use these
+# helpers when the uint8 buffer must be byte-compatible with
+# `en_dtypes.hifloat8` (e.g. when serialising weights for off-GPU tooling
+# or feeding an Atlas A2 NPU).
+#
+# Both layouts represent exactly the same 254 finite values; only the
+# bit pattern of the byte differs. NaN is represented as 0x80 in both
+# (matching en-dtypes; the LUT-rank kernel was patched to honour this too).
+
+
+def hifp8_encode_uint8_ascend(
+    x: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+    amax_clip: Optional[float] = None,
+    scale_factor: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Like ``hifp8_encode_uint8`` but emits the Ascend / en-dtypes byte layout."""
+    if not HAS_CUDA_KERNELS:
+        raise RuntimeError("HiFloat8 CUDA kernels not available.")
+    if not x.is_cuda:
+        raise ValueError("hifp8_encode_uint8_ascend requires CUDA tensors")
+
+    x_f32 = x.float() if x.dtype != torch.float32 else x
+
+    squeeze = False
+    if x_f32.dim() == 1:
+        x_f32 = x_f32.unsqueeze(0)
+        squeeze = True
+    elif x_f32.dim() != 2:
+        raise ValueError(f"Expected 1D or 2D tensor, got {x_f32.dim()}D")
+
+    if scale is None:
+        scale = choose_scale_hifp8(x_f32, amax_clip=amax_clip, scale_factor=scale_factor)
+
+    x_scaled = x_f32 / scale.unsqueeze(-1)
+    uint8_data = hif8_cuda.hif8_encode_ascend_cuda(x_scaled.contiguous())
+
+    if squeeze:
+        return uint8_data.squeeze(0), scale
+    return uint8_data, scale
+
+
+def hifp8_decode_uint8_ascend(
+    data: torch.Tensor,
+    scale: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Like ``hifp8_decode_uint8`` but interprets the Ascend / en-dtypes byte layout."""
+    if not HAS_CUDA_KERNELS:
+        raise RuntimeError("HiFloat8 CUDA kernels not available.")
+    if not data.is_cuda:
+        raise ValueError("hifp8_decode_uint8_ascend requires CUDA tensors")
+    if data.dtype != torch.uint8:
+        raise ValueError(f"Expected uint8 data, got {data.dtype}")
+
+    squeeze = False
+    if data.dim() == 1:
+        data = data.unsqueeze(0)
+        scale = scale.view(-1)
+        squeeze = True
+
+    decoded = hif8_cuda.hif8_decode_ascend_cuda(data.contiguous())  # float32
+    decoded = decoded * scale.float().unsqueeze(-1)
+
+    if squeeze:
+        decoded = decoded.squeeze(0)
+
+    return decoded.to(output_dtype)
+
+
+def hifp8_encode_uint8_ascend_simple(x: torch.Tensor) -> torch.Tensor:
+    """Encode without scaling, Ascend byte layout."""
+    if not HAS_CUDA_KERNELS:
+        raise RuntimeError("HiFloat8 CUDA kernels not available")
+    if not x.is_cuda:
+        raise ValueError("Requires CUDA tensor")
+    return hif8_cuda.hif8_encode_ascend_cuda(x.float() if x.dtype != torch.float32 else x)
+
+
+def hifp8_decode_uint8_ascend_simple(
+    data: torch.Tensor,
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Decode without scaling, Ascend byte layout."""
+    if not HAS_CUDA_KERNELS:
+        raise RuntimeError("HiFloat8 CUDA kernels not available")
+    if not data.is_cuda:
+        raise ValueError("Requires CUDA tensor")
+    return hif8_cuda.hif8_decode_ascend_cuda(data).to(output_dtype)
+
+
+# ---------------------------------------------------------------------------
+# Branchless LUT-only encode (~2× faster, byte-identical output)
+# ---------------------------------------------------------------------------
+#
+# Uses a 4096-entry encode LUT indexed by (float32 exp[8] | top_4_mant[4])
+# instead of running hif8_round_float + binary search per element. Output
+# bytes are byte-for-byte identical to the math path (verified on >8M
+# random samples + exhaustive (exp,top4) coverage). Only `exp == 0xFF`
+# (NaN/Inf) is branched.
+
+
+def hifp8_encode_uint8_lut_only_simple(x: torch.Tensor) -> torch.Tensor:
+    """Encode without scaling, LUT-rank byte layout, fast LUT-only path."""
+    if not HAS_CUDA_KERNELS:
+        raise RuntimeError("HiFloat8 CUDA kernels not available")
+    if not x.is_cuda:
+        raise ValueError("Requires CUDA tensor")
+    return hif8_cuda.hif8_encode_lut_only_cuda(
+        x.float() if x.dtype != torch.float32 else x
+    )
+
+
+def hifp8_encode_uint8_ascend_lut_only_simple(x: torch.Tensor) -> torch.Tensor:
+    """Encode without scaling, Ascend byte layout, fast LUT-only path."""
+    if not HAS_CUDA_KERNELS:
+        raise RuntimeError("HiFloat8 CUDA kernels not available")
+    if not x.is_cuda:
+        raise ValueError("Requires CUDA tensor")
+    return hif8_cuda.hif8_encode_ascend_lut_only_cuda(
+        x.float() if x.dtype != torch.float32 else x
+    )

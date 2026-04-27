@@ -9,8 +9,14 @@ build/
 dist/
 custom_ops/build/
 
-# Output
+# Output (legacy + new pipeline artifacts).
+# Keep tiny REPORT.md + eval_*.json under outputs/, exclude heavy artifacts.
 output/
+outputs/qwen3_*/
+outputs/vendor/
+outputs/logs/
+outputs/eval_results/
+outputs/.phase_*_done
 
 # IDE
 .vscode/
@@ -19,6 +25,7 @@ output/
 # OS
 .DS_Store
 
-# Claude Code
+# Claude Code (brainstorming specs + plans + memory)
 CLAUDE.md
 .claude/
+docs/superpowers/

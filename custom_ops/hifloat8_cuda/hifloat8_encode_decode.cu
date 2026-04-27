@@ -5,10 +5,20 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include "hifloat8_lut.h"
+#include "hifloat8_ascend_remap.h"   // Ascend bit-layout remap tables
+#include "hifloat8_encode_lut.h"     // LUT-only float-bits → byte encode tables
 #include "hif8_round.cuh"  // Inline rounding function
 
-// Encoding: float → uint8
+// LUT-rank specials. 0x80 was previously an unused -0 alias; we now
+// repurpose it as the NaN sentinel (matching en-dtypes / Ascend HiFloat8),
+// since the encoder never emitted 0x80 before (existing payloads stay valid).
+#define HIF8_LUT_RANK_NAN  0x80
+
+// Encoding: float → uint8 (LUT-rank layout, NaN-aware)
 __device__ __forceinline__ uint8_t hif8_encode_uint8_device(float x) {
+    if (__isnanf(x))
+        return HIF8_LUT_RANK_NAN;
+
     float rounded = hif8_round_float(x);
 
     if (rounded == 0.0f || rounded == -0.0f)
@@ -24,12 +34,97 @@ __device__ __forceinline__ uint8_t hif8_encode_uint8_device(float x) {
     return sign_bit | index;
 }
 
-// Decoding: uint8 → float
+// Decoding: uint8 → float (LUT-rank layout, NaN-aware)
 __device__ __forceinline__ float hif8_decode_uint8_device(uint8_t encoded) {
+    if (encoded == HIF8_LUT_RANK_NAN)
+        return __int_as_float(0x7fc00000);  // quiet NaN
+
     bool is_negative = (encoded & 0x80) != 0;
     uint8_t index = encoded & 0x7F;
     float magnitude = hif8_lookup_value(index);
     return is_negative ? -magnitude : magnitude;
+}
+
+// ============================================================================
+// Ascend HiFloat8 byte layout (en-dtypes / NPU hardware-compatible)
+// ============================================================================
+//
+// hif8_round_float collapses every float to a HiFloat8-representable
+// magnitude indexed by HIF8_DECODE_LUT[rank]. The Ascend layout uses a
+// different bit pattern for the same magnitude. We bridge via a 128-entry
+// remap (REPO_RANK_TO_ASCEND_LO / ASCEND_DECODE_LUT in hifloat8_ascend_remap.h).
+
+__device__ __forceinline__ uint8_t hif8_encode_ascend_device(float x) {
+    if (__isnanf(x))
+        return ASCEND_NAN;
+
+    float rounded = hif8_round_float(x);
+
+    if (rounded == 0.0f || rounded == -0.0f)
+        return ASCEND_ZERO;
+
+    if (__isinff(rounded))
+        return (rounded > 0) ? ASCEND_PINF : ASCEND_NINF;
+
+    uint8_t sign_bit = (rounded < 0.0f) ? 0x80 : 0x00;
+    float magnitude = fabsf(rounded);
+    uint8_t rank = hif8_find_index(magnitude);     // 0..126
+    return sign_bit | REPO_RANK_TO_ASCEND_LO[rank];
+}
+
+__device__ __forceinline__ float hif8_decode_ascend_device(uint8_t encoded) {
+    if (encoded == ASCEND_NAN)
+        return __int_as_float(0x7fc00000);  // quiet NaN
+
+    bool is_negative = (encoded & 0x80) != 0;
+    uint8_t lo = encoded & 0x7F;
+    float magnitude = ASCEND_DECODE_LUT[lo];   // Inf magnitude embedded at lo=0x6F
+    return is_negative ? -magnitude : magnitude;
+}
+
+// ============================================================================
+// LUT-only encode path: replaces hif8_round_float + hif8_find_index with a
+// single 4096-entry table lookup indexed by float32's (exp[8] | top_4_mant[4]).
+//
+// Correct because HiFloat8 rounds half-away-from-zero — no sticky bit needed,
+// so 4 mantissa bits (3 keep + 1 round) fully determine the rounded value.
+// Only `exp == 0xFF` requires a branch to disambiguate ±Inf from NaN.
+// ============================================================================
+
+__device__ __forceinline__ uint8_t hif8_encode_uint8_lut_only_device(float x) {
+    uint32_t bits = __float_as_uint(x);
+    uint32_t exp_field = (bits >> 23) & 0xFF;
+    uint32_t mant_field = bits & 0x007FFFFF;
+    uint32_t sign_bit = (bits >> 24) & 0x80;       // sign in bit 7 directly
+
+    if (exp_field == 0xFF) {                       // NaN or ±Inf
+        if (mant_field != 0) return HIF8_LUT_RANK_NAN;   // any NaN → 0x80
+        return (uint8_t)(sign_bit | 0x7F);               // ±Inf
+    }
+
+    uint32_t idx = (exp_field << 4) | (mant_field >> 19);
+    uint32_t mag = HIF8_ENCODE_LUT_RANK_LO[idx];
+    // Suppress sign on zero magnitude — otherwise -0/underflow would emit
+    // 0x80, which now means NaN. Branchless mask: 0xFF when mag != 0, else 0.
+    uint32_t sign_mask = -(uint32_t)(mag != 0u);
+    return (uint8_t)((sign_bit & sign_mask) | mag);
+}
+
+__device__ __forceinline__ uint8_t hif8_encode_ascend_lut_only_device(float x) {
+    uint32_t bits = __float_as_uint(x);
+    uint32_t exp_field = (bits >> 23) & 0xFF;
+    uint32_t mant_field = bits & 0x007FFFFF;
+    uint32_t sign_bit = (bits >> 24) & 0x80;
+
+    if (exp_field == 0xFF) {
+        if (mant_field != 0) return ASCEND_NAN;
+        return (uint8_t)(sign_bit | ASCEND_PINF);        // sign | 0x6F
+    }
+
+    uint32_t idx = (exp_field << 4) | (mant_field >> 19);
+    uint32_t mag = HIF8_ENCODE_ASCEND_LO[idx];
+    uint32_t sign_mask = -(uint32_t)(mag != 0u);
+    return (uint8_t)((sign_bit & sign_mask) | mag);
 }
 
 // Kernels
@@ -44,6 +139,36 @@ __global__ void hif8_decode_kernel(float* output, const uint8_t* input, int64_t 
     int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         output[idx] = hif8_decode_uint8_device(input[idx]);
+    }
+}
+
+// Ascend-format encode/decode kernels (1:1 with the LUT-rank ones)
+__global__ void hif8_encode_ascend_kernel(uint8_t* output, const float* input, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = hif8_encode_ascend_device(input[idx]);
+    }
+}
+
+__global__ void hif8_decode_ascend_kernel(float* output, const uint8_t* input, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = hif8_decode_ascend_device(input[idx]);
+    }
+}
+
+// LUT-only encode kernels (no rounding math, no binary search).
+__global__ void hif8_encode_lut_only_kernel(uint8_t* output, const float* input, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = hif8_encode_uint8_lut_only_device(input[idx]);
+    }
+}
+
+__global__ void hif8_encode_ascend_lut_only_kernel(uint8_t* output, const float* input, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = hif8_encode_ascend_lut_only_device(input[idx]);
     }
 }
 
@@ -130,6 +255,84 @@ torch::Tensor hif8_decode_cuda(torch::Tensor input) {
         n
     );
 
+    return output;
+}
+
+// Ascend-format host launchers
+torch::Tensor hif8_encode_ascend_cuda(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat32,
+                "Expected float32 CUDA tensor");
+
+    auto input_contig = input.contiguous();
+    auto output = torch::empty_like(input_contig, torch::dtype(torch::kUInt8));
+    int64_t n = input_contig.numel();
+    if (n == 0) return output;
+
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+
+    hif8_encode_ascend_kernel<<<blocks, threads>>>(
+        output.data_ptr<uint8_t>(),
+        input_contig.data_ptr<float>(),
+        n
+    );
+
+    return output;
+}
+
+torch::Tensor hif8_decode_ascend_cuda(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kUInt8,
+                "Expected uint8 CUDA tensor");
+
+    auto input_contig = input.contiguous();
+    auto output = torch::empty_like(input_contig, torch::dtype(torch::kFloat32));
+    int64_t n = input_contig.numel();
+    if (n == 0) return output;
+
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+
+    hif8_decode_ascend_kernel<<<blocks, threads>>>(
+        output.data_ptr<float>(),
+        input_contig.data_ptr<uint8_t>(),
+        n
+    );
+
+    return output;
+}
+
+// LUT-only encode host launchers
+torch::Tensor hif8_encode_lut_only_cuda(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat32,
+                "Expected float32 CUDA tensor");
+    auto input_contig = input.contiguous();
+    auto output = torch::empty_like(input_contig, torch::dtype(torch::kUInt8));
+    int64_t n = input_contig.numel();
+    if (n == 0) return output;
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    hif8_encode_lut_only_kernel<<<blocks, threads>>>(
+        output.data_ptr<uint8_t>(),
+        input_contig.data_ptr<float>(),
+        n
+    );
+    return output;
+}
+
+torch::Tensor hif8_encode_ascend_lut_only_cuda(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat32,
+                "Expected float32 CUDA tensor");
+    auto input_contig = input.contiguous();
+    auto output = torch::empty_like(input_contig, torch::dtype(torch::kUInt8));
+    int64_t n = input_contig.numel();
+    if (n == 0) return output;
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    hif8_encode_ascend_lut_only_kernel<<<blocks, threads>>>(
+        output.data_ptr<uint8_t>(),
+        input_contig.data_ptr<float>(),
+        n
+    );
     return output;
 }
 
@@ -361,8 +564,16 @@ torch::Tensor hif8_fake_quant(torch::Tensor input) {
 
 // Python bindings
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("hif8_encode_cuda", &hif8_encode_cuda, "HiFloat8 encode to uint8 (CUDA)");
-    m.def("hif8_decode_cuda", &hif8_decode_cuda, "HiFloat8 decode from uint8 (CUDA)");
+    m.def("hif8_encode_cuda", &hif8_encode_cuda, "HiFloat8 encode to uint8 (CUDA, LUT-rank layout)");
+    m.def("hif8_decode_cuda", &hif8_decode_cuda, "HiFloat8 decode from uint8 (CUDA, LUT-rank layout)");
+    m.def("hif8_encode_ascend_cuda", &hif8_encode_ascend_cuda,
+          "HiFloat8 encode to uint8 (CUDA, Ascend / en-dtypes byte layout)");
+    m.def("hif8_decode_ascend_cuda", &hif8_decode_ascend_cuda,
+          "HiFloat8 decode from uint8 (CUDA, Ascend / en-dtypes byte layout)");
+    m.def("hif8_encode_lut_only_cuda", &hif8_encode_lut_only_cuda,
+          "HiFloat8 encode (CUDA, LUT-rank layout, branchless float-bits→byte LUT)");
+    m.def("hif8_encode_ascend_lut_only_cuda", &hif8_encode_ascend_lut_only_cuda,
+          "HiFloat8 encode (CUDA, Ascend layout, branchless float-bits→byte LUT)");
     m.def("hif8_encode_with_scale_cuda", &hif8_encode_with_scale_cuda,
           "HiFloat8 encode with per-row scaling (CUDA)");
     m.def("hif8_decode_with_scale_cuda", &hif8_decode_with_scale_cuda,

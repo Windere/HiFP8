@@ -39,6 +39,19 @@ class HiFP8FakeQuantizer(nn.Module):
         # Per-instance static scale (set during calibration)
         self.static_scale: Optional[torch.Tensor] = None
 
+        # QAT path: wrap fake-quant in autograd.Function with STE so
+        # loss.backward() flows gradients through this layer.
+        self.qat = bool(getattr(config, "qat", False))
+        if self.qat:
+            from .hifp8_ste import hifp8_fake_quantize_ste
+
+            def _qat_fn(x, p1, p2, *, granularity, target_dtype,
+                        static_scale, scale_factor):
+                return hifp8_fake_quantize_ste(
+                    x, static_scale=static_scale, scale_factor=scale_factor,
+                )
+            self._quantize_fn = _qat_fn
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.enabled:
             return x

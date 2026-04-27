@@ -46,6 +46,8 @@ class HiFP8FakeQuantizeConfig:
         scale_factor: Divisor in scale = amax / scale_factor. Default: 1.0.
                       Set to 1.0 to normalize into [-1, 1] (highest LUT precision).
                       Set to HIF8_MAX (32768) to use full HiFloat8 range.
+        qat: If True, route forward through torch.autograd.Function with STE
+             so gradients flow during training. Default False (PTQ-only).
     """
     granularity: object = field(default_factory=PerRow)
     target_dtype: torch.dtype = torch.float8_e4m3fn
@@ -54,6 +56,7 @@ class HiFP8FakeQuantizeConfig:
     param2: int = 0
     enabled: bool = True
     scale_factor: float = 1.0
+    qat: bool = False
 
 
 # Backward compatibility alias
