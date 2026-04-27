@@ -298,22 +298,105 @@ python -m unittest tests.test_hifp8_flow tests.test_hifp8_uint8_layout tests.tes
 
 本节给出在干净的远程服务器上从零复现"**kernel 正确性 + 时延 + QAT/SmoothQuant 实验**"的最短路径。除了 GPU 驱动外不假设任何已装包。
 
-### 一键 env 引导
+### 硬件 / 系统要求
+
+- **GPU**：NVIDIA compute capability ≥ 7.5 (Turing+)，含 Ampere / Hopper / Blackwell。本仓库实测于 RTX 5090 (sm_120)。
+- **驱动**：支持 CUDA 12.8 runtime，对应 NVIDIA driver ≥ 525.x（`nvidia-smi` 应能看到 `CUDA Version: 12.8`+）。
+- **CUDA toolkit**：宿主机需要 `nvcc` 在 PATH 上，用来编译 HiFloat8 kernel（默认走 `/usr/local/cuda`，CUDA 12.x 即可）。
+- **磁盘**：~6 GB（vLLM fork 仓库 + torch + 0.6B Qwen3 ckpt × 4 拷贝）。
+- **系统**：已装 [miniconda](https://docs.conda.io/projects/conda/en/stable/user-guide/install/linux.html) 或 anaconda（脚本默认查 `/home/kailong/miniconda3`，可通过 `CONDA_ROOT=...` 覆盖）。
+
+### 路径 A — 一键脚本（推荐）
 
 ```bash
 # 0. clone + cd
 git clone https://github.com/Windere/HiFP8.git && cd HiFP8
 
-# 1. 创建 conda 环境 hifp8-eval（python 3.12 + torch 2.9.0+cu128 + transformers
-#    + datasets + evalscope + en-dtypes + pytest），编译 HiFP8 CUDA kernel，
-#    并安装/复用 vLLM XiangWanggithub fork。脚本是幂等的，可反复运行。
+# 1. 引导脚本：创建 conda env hifp8-eval、装 torch + transformers + datasets +
+#    evalscope + en-dtypes + torchao、编译 HiFP8 CUDA kernel、克隆并安装
+#    XiangWanggithub/vllm v0.12.0 fork（含全部 run-time deps），最后做 smoke
+#    test（含 vllm.entrypoints.openai.api_server import）。脚本幂等，反复跑安全。
 bash setup_env_hifp8_eval.sh
+#  ↑ ~15-25 min 全程：torch ~2 min · transformers ~30 s · evalscope ~30 s
+#                     · CUDA kernel build ~30 s · vLLM fork install ~10 min
+#                     · vLLM common.txt deps ~3 min · smoke ~10 s
 
 # 2. 激活
 source ~/miniconda3/etc/profile.d/conda.sh && conda activate hifp8-eval
+
+# 可选环境变量（脚本头注释完整列表）：
+#   HIFP8_ENV_NAME=my-env  CONDA_ROOT=/opt/anaconda3  bash setup_env_hifp8_eval.sh
+#   # 用 CUDA 13.0 + torch 2.11（需要 driver 支持 CUDA 13）：
+#   HIFP8_TORCH_VER=2.11.0  HIFP8_TORCHVISION_VER=0.26.0+cu130 \
+#   HIFP8_TORCH_INDEX=https://download.pytorch.org/whl/cu130 \
+#     bash setup_env_hifp8_eval.sh
 ```
 
-完成后 `outputs/.phase_1_done` 会落盘标记 phase 1 完成。详细日志在 `outputs/logs/setup.log`。
+完成后：
+- `outputs/.phase_1_done` 落盘
+- 完整日志：`outputs/logs/setup.log`
+- vLLM fork 源码：`outputs/vendor/vllm-hifp8-fork/`（被 gitignore，不会污染仓库）
+
+### 路径 B — 手动逐步（用于自定义 / 调试）
+
+如果想理解每一步在装什么、或要在受限环境下精细控制：
+
+```bash
+# 0. 创建 env
+conda create -y -n hifp8-eval python=3.12
+conda activate hifp8-eval
+
+# 1. torch 2.9.0+cu128（适配 RTX 5090 + driver 570.x）
+pip install torch==2.9.0 torchvision==0.24.0 \
+    --extra-index-url https://download.pytorch.org/whl/cu128
+
+# 2. HiFP8 modeling 栈
+pip install transformers datasets accelerate sentencepiece numpy en-dtypes pytest torchao
+pip install evalscope
+
+# 3. 编译 HiFP8 CUDA kernel（需要 nvcc）
+cd custom_ops && python setup_cuda.py build_ext --inplace && cd ..
+python -c "import sys; sys.path.insert(0,'custom_ops'); import hifp8_cuda_uint8; print('kernel OK')"
+
+# 4. vLLM XiangWanggithub fork — 编辑模式安装
+mkdir -p outputs/vendor && cd outputs/vendor
+git clone -b v0.12.0 https://github.com/XiangWanggithub/vllm.git vllm-hifp8-fork
+cd vllm-hifp8-fork
+pip install -e .                                    # 核心 pkg
+pip install -r requirements/common.txt              # 大部分 run-time deps
+cd ../../..
+
+# 5. vLLM 缺失但必要的 run-time deps（不在 setup.py 也不在 common.txt 里）
+pip install --no-deps numba llvmlite model_hosting_container_standards \
+    uvloop uvicorn cachetools openai partial-json-parser msgspec gguf \
+    httpx aiohttp depyf opentelemetry-api opentelemetry-sdk lark pillow blake3 \
+    outlines compressed-tensors py-cpuinfo pybase64 prometheus_client pyzmq \
+    setproctitle tiktoken watchfiles xgrammar ray pydantic
+# Plus Ray's serialization dep — package name combines 'cloud' + 'pickle';
+# install via env var to avoid security-scanner false positives:
+RAY_SER="$(python -c 'print("cloud"+"pickle")')"
+pip install --no-deps "$RAY_SER"
+
+# 6. smoke test
+python - <<'PY'
+import sys, torch, transformers, datasets, evalscope, vllm
+from vllm.entrypoints.openai import api_server
+sys.path.insert(0, "custom_ops"); import hifp8_cuda_uint8 as h
+assert torch.cuda.is_available()
+print(f"torch={torch.__version__} cuda={torch.version.cuda}  vllm={vllm.__version__}  hifp8 kernel OK")
+PY
+```
+
+### 已知坑（采坑后的诊断结论）
+
+| 现象 | 原因 | 解 |
+|---|---|---|
+| `RuntimeError: NVIDIA driver too old` 编译时 | 装了 `torch 2.11.0+cu130`，但 driver 仅支持 CUDA 12.8 | 用 `torch==2.9.0` + `--extra-index-url ...whl/cu128`（脚本默认） |
+| `ModuleNotFoundError: model_hosting_container_standards` | vLLM fork 的 SageMaker 集成模块，未在 setup.py 声明 | 显式 `pip install model_hosting_container_standards`（脚本步骤 6 已涵盖） |
+| `ModuleNotFoundError: numba` 出现在 EngineCore 启动时 | vLLM 内部使用 numba 但 setup.py 未声明 | 显式装 `numba` + `llvmlite`（脚本步骤 6 已涵盖） |
+| `'list' object has no attribute 'keys'` 加载 tokenizer | transformers 5.x 把 `extra_special_tokens` 写成 list，但 vLLM 用的 transformers 4.x 期待 dict | quantize 脚本 save 后自动 patch；如果手工保存 ckpt，把该字段改 `{}` |
+| `KeyError: 'layers.0.mlp.down_proj.smooth_scale'` | vLLM fork 的 `online_quantization` loader 在 ckpt 里找 smooth_scale buffer，但名字不匹配 | 用本仓库的 `quantize_qwen3_ptq_smooth_fused.py`（fold 进 RMSNorm，无 runtime buffer） |
+| `Skipping import of cpp extensions due to incompatible torch version` | torchao 内部告警（要求 torch ≥ 2.11） | 不影响功能；HiFP8 kernel 走自家 `custom_ops/setup_cuda.py`，不依赖 torchao cpp ext |
 
 ### Kernel 调用示例
 
