@@ -182,30 +182,124 @@ def parse_evalscope_results(work_dir: Path) -> dict:
 # Report writer
 # ---------------------------------------------------------------------------
 
-def write_report(per_label: dict[str, dict], benchmarks: list[str]):
-    # Aggregate into a clean (label, benchmark)→score table.
-    # Keys we expect from parse_evalscope_results: "arc", "gsm8k",
-    # "arc-easy", "arc-challenge".
-    summary = per_label
+# Per-label display + method blurb metadata. Centralised so the title /
+# table headers / Method details section all stay in sync as we add or
+# remove labels.
+_LABEL_META = {
+    "bf16": {
+        "display": "bf16",
+        "long":    "BF16 baseline",
+        "method":  "BF16 reference (no quantization).",
+    },
+    "ptq": {
+        "display": "naive_ptq",
+        "long":    "naive HiFP8 PTQ",
+        "method":  "BF16 → in-place HiFP8 fake-quant on every Linear weight "
+                   "(weight-only, no SmoothQuant). Per-row dynamic scale.",
+    },
+    "ptq_smooth": {
+        "display": "ptq_smooth",
+        "long":    "HiFP8 + SmoothQuant fold",
+        "method":  "naive SmoothQuant (alpha=0.5, 32 wikitext batches) → "
+                   "**fold-into-RMSNorm** fusion (q/k/v share input_layernorm, "
+                   "gate/up share post_attention_layernorm; o_proj/down_proj "
+                   "rolled back since no preceding norm to fold into) → HiFP8 "
+                   "fake-quant baked into Linear weights → plain nn.Linear save. "
+                   "**Zero runtime smooth_scale dependency** — any inference "
+                   "framework can serve it.",
+    },
+    "qat": {
+        "display": "qat",
+        "long":    "HiFP8 QAT",
+        "method":  "BF16 → 2 000 distillation steps (bs=1, grad-accum=4, "
+                   "seq=512, AdamW lr=1e-5, 0.5·CE + 0.5·KL with frozen BF16 "
+                   "teacher, T=2.0) on wikitext-103-raw, with "
+                   "HiFP8FakeQuantizedLinear(qat=True) wrapping every weight "
+                   "Linear. Trained from raw BF16 (not from PTQ).",
+    },
+}
 
-    rows = ["| benchmark      | bf16   | ptq    | ptq_smooth | qat    | Δ smooth-ptq | Δ qat-bf16 |",
-            "| -------------- | ------ | ------ | ---------- | ------ | ------------ | ---------- |"]
-    bench_keys = ["arc-easy", "arc-challenge", "arc", "gsm8k"]
-    for b in bench_keys:
-        if all(b not in summary.get(lbl, {}) for lbl in
-                ("bf16", "ptq", "ptq_smooth", "qat")):
+_WAY_WORD = {1: "Single", 2: "Two-way", 3: "Three-way", 4: "Four-way"}
+
+# Delta columns to include — only emit when both endpoints have data.
+_DELTA_SPECS = [
+    {"name": "Δ smooth-ptq",  "minus": "ptq_smooth", "from": "ptq",
+     "explain": "marginal benefit of fold-into-RMSNorm SmoothQuant on top of "
+                "weight-only PTQ. Positive = SmoothQuant helped."},
+    {"name": "Δ qat-bf16",    "minus": "qat",        "from": "bf16",
+     "explain": "total QAT loss vs lossless baseline. (QAT did not start "
+                "from PTQ, so a fair PTQ-vs-QAT delta isn't well-defined.)"},
+]
+
+
+def _has_numeric_data(blob) -> bool:
+    if not isinstance(blob, dict) or not blob:
+        return False
+    for v in blob.values():
+        try:
+            f = float(v)
+            if f == f:   # not NaN
+                return True
+        except (TypeError, ValueError):
             continue
-        bf = float(summary.get("bf16", {}).get(b, float("nan")))
-        pt = float(summary.get("ptq", {}).get(b, float("nan")))
-        ps = float(summary.get("ptq_smooth", {}).get(b, float("nan")))
-        qa = float(summary.get("qat", {}).get(b, float("nan")))
-        d_smooth = (ps - pt) if (ps == ps and pt == pt) else float("nan")
-        d_qat = (qa - bf) if (qa == qa and bf == bf) else float("nan")
-        rows.append(
-            f"| {b:<14} | {bf:6.3f} | {pt:6.3f} | {ps:10.3f} | {qa:6.3f} | "
-            f"{d_smooth:+12.3f} | {d_qat:+10.3f} |"
-        )
+    return False
 
+
+def write_report(per_label: dict[str, dict], benchmarks: list[str]):
+    # 1) Identify which labels actually carry data — drives every section
+    canonical_order = [lbl for lbl, _, _, _ in CONFIGS]
+    active = [l for l in canonical_order if _has_numeric_data(per_label.get(l, {}))]
+    n_way = len(active)
+    way_word = _WAY_WORD.get(n_way, f"{n_way}-way")
+    title_suffix = " vs ".join(_LABEL_META[l]["long"] for l in active)
+
+    # 2) Active deltas (need both endpoints in `active`)
+    active_deltas = [d for d in _DELTA_SPECS
+                     if d["minus"] in active and d["from"] in active]
+
+    # 3) Build results table dynamically
+    bench_keys = ["arc-easy", "arc-challenge", "arc", "gsm8k"]
+    if not active:
+        results_block = ["_(no labels carried data — eval may have failed for every config)_"]
+    else:
+        # Column widths chosen so headers + numeric cells line up nicely.
+        bench_w = 14
+        score_w = max(8, max(len(_LABEL_META[l]["display"]) for l in active))
+        delta_w = max(13, max((len(d["name"]) for d in active_deltas), default=0))
+
+        header = ["benchmark".ljust(bench_w)] \
+                 + [_LABEL_META[l]["display"].rjust(score_w) for l in active] \
+                 + [d["name"].rjust(delta_w) for d in active_deltas]
+        sep = ["-" * bench_w] \
+              + ["-" * score_w] * len(active) \
+              + ["-" * delta_w] * len(active_deltas)
+        rows = ["| " + " | ".join(header) + " |",
+                "| " + " | ".join(sep) + " |"]
+        for b in bench_keys:
+            if all(b not in per_label.get(l, {}) for l in active):
+                continue
+            scores = {l: float(per_label.get(l, {}).get(b, float("nan"))) for l in active}
+            cells = [b.ljust(bench_w)]
+            for l in active:
+                v = scores[l]
+                cells.append(f"{v:>{score_w}.3f}")
+            for d in active_deltas:
+                a, c = scores.get(d["minus"], float("nan")), scores.get(d["from"], float("nan"))
+                v = (a - c) if (a == a and c == c) else float("nan")
+                cells.append(f"{v:>+{delta_w}.3f}")
+            rows.append("| " + " | ".join(cells) + " |")
+        results_block = rows
+
+    # 4) Configurations table — only active labels
+    cfg_rows = [(l, m, q) for l, m, _, q in CONFIGS if l in active]
+
+    # 5) Notes — only for active configs + active deltas
+    method_lines = [f"- **{l}** = {_LABEL_META[l]['method']}" for l in active]
+    delta_lines = [f"- **{d['name']}**: {d['explain']}" for d in active_deltas]
+
+    # 6) Optional appendix — keep visible in any "smooth + ptq" report so
+    # readers know the cross-layer fold experiment + why we shipped without it.
+    show_appendix = "ptq_smooth" in active
     appendix = """
 ### Appendix A — what we tried that didn't work
 
@@ -236,53 +330,46 @@ The variant is preserved in code as `--full-fold` flag (see
 `fuse_crosslayer_smooths` in `quantization/smooth_fuse.py`. Use only if
 you switch to a per-output-channel weight quantizer or AWQ-style scaling.
 """
+
+    title_main = f"# HiFP8 Eval — Qwen3-0.6B {way_word}"
+    if title_suffix:
+        title_main += f" ({title_suffix})"
+
     body = [
-        "# HiFP8 QAT Pipeline — Qwen3-0.6B Four-way Eval",
+        title_main,
         f"_Generated {time.strftime('%Y-%m-%d %H:%M:%S')}_",
         "",
         "## Configurations",
         "",
         "| label | model path | quant_method |",
         "| ----- | ---------- | ------------ |",
-        *[f"| {l} | `{m}` | {q or '—'} |" for l, m, _, q in CONFIGS],
+        *[f"| {l} | `{m}` | {q or '—'} |" for l, m, q in cfg_rows],
         "",
         "## Results",
         "",
-        *rows,
+        *results_block,
         "",
         "## Notes",
-        f"- Benchmarks: {', '.join(benchmarks)} (`--limit 200` per subset).",
-        "- All four models are served via stock vLLM (BF16 path) on unique ports "
-        "(bf16: 8050, ptq: 8051, ptq_smooth: 8053, qat: 8052). The HiFP8-rounded "
-        "weights are stored in BF16 storage, so no quant-method-aware loader is needed.",
+        f"- Benchmarks: {', '.join(benchmarks)}.",
+        "- Models served via stock vLLM (BF16 path) on per-label ports. "
+        "HiFP8-rounded weights are stored in BF16, so no quant-method-aware "
+        "loader is needed.",
         "- evalscope client targets the OpenAI-compatible endpoint of each server.",
         "",
         "### Method details",
-        "- **ptq** = BF16 → in-place HiFP8 fake-quant on every Linear weight "
-        "(weight-only, no SmoothQuant). Per-row dynamic scale.",
-        "- **ptq_smooth** = naive SmoothQuant (alpha=0.5, 32 wikitext batches) → "
-        "**fold-into-RMSNorm** fusion (q/k/v share input_layernorm, gate/up share "
-        "post_attention_layernorm; o_proj/down_proj rolled back since no preceding "
-        "norm to fold into) → HiFP8 fake-quant baked into Linear weights → plain "
-        "nn.Linear save. **Zero runtime smooth_scale dependency** — any inference "
-        "framework can serve it.",
-        "- **qat** = BF16 → 2 000 distillation steps (bs=1, grad-accum=4, seq=512, "
-        "AdamW lr=1e-5, 0.5·CE + 0.5·KL with frozen BF16 teacher, T=2.0) on "
-        "wikitext-103-raw, with HiFP8FakeQuantizedLinear(qat=True) wrapping every "
-        "weight Linear. Trained from raw BF16 (not from PTQ).",
-        "",
-        "### Reading the deltas",
-        "- **Δ smooth-ptq**: marginal benefit of fold-into-RMSNorm SmoothQuant on "
-        "top of weight-only PTQ. Positive = SmoothQuant helped.",
-        "- **Δ qat-bf16**: total QAT loss vs lossless baseline. (QAT did not start "
-        "from PTQ, so a fair PTQ-vs-QAT delta isn't well-defined.)",
+        *method_lines,
+    ]
+    if active_deltas:
+        body += ["", "### Reading the deltas", *delta_lines]
+    body += [
         "",
         "## Raw evalscope output",
         "",
-        *[f"- `{label}` → `outputs/eval_results/{label}/`"
-          for label in per_label],
-        appendix,
+        *[f"- `{label}` → `outputs/eval_results/{label}/`" for label in active],
     ]
+    if show_appendix:
+        body.append(appendix)
+
     REPORT_PATH.write_text("\n".join(body) + "\n")
     print(f"  [report] wrote {REPORT_PATH}")
 
