@@ -63,10 +63,15 @@ def build_smooth_ckpt(alpha: float, force: bool = False) -> Path:
 
 def evaluate(label: str, ckpt_dir: Path, port: int,
              benchmarks: list[str], limit: int,
-             startup_timeout: int = 600) -> dict:
+             startup_timeout: int = 600,
+             gpu_mem_util: float = 0.5,
+             cuda_device: str = None) -> dict:
     """Spin up vLLM, run evalscope on benchmarks, parse, tear down. Returns scores dict."""
-    print(f"\n[eval {label}] {ckpt_dir} on :{port}")
-    proc = e3.start_vllm(str(ckpt_dir), port, label)
+    print(f"\n[eval {label}] {ckpt_dir} on :{port}  (gpu_mem_util={gpu_mem_util}, "
+          f"CUDA_VISIBLE_DEVICES={cuda_device or os.environ.get('HIFP8_CUDA_DEVICE','0')})")
+    proc = e3.start_vllm(str(ckpt_dir), port, label,
+                         gpu_mem_util=gpu_mem_util,
+                         cuda_visible_devices=cuda_device)
     try:
         if not e3.wait_for_server(port, timeout=startup_timeout, label=label):
             return {"_error": f"server-startup-failed-after-{startup_timeout}s"}
@@ -180,6 +185,12 @@ def main():
                     help="Re-run bf16 + naive PTQ instead of using cached eval_bf16.json / eval_ptq.json")
     ap.add_argument("--port-base", type=int, default=8060,
                     help="Base port for vLLM servers (one port per alpha).")
+    ap.add_argument("--gpu-mem-util", type=float, default=0.5,
+                    help="vLLM --gpu-memory-utilization. Lower it on a "
+                         "shared GPU (e.g. 0.3 for ~9 GB on a 32 GB card).")
+    ap.add_argument("--cuda-device", default=None,
+                    help="CUDA_VISIBLE_DEVICES for vLLM servers, e.g. '0' or '1'. "
+                         "If unset, falls back to env $HIFP8_CUDA_DEVICE then '0'.")
     args = ap.parse_args()
 
     print(f"alphas      : {args.alphas}")
@@ -200,6 +211,7 @@ def main():
                 "bf16", "Qwen/Qwen3-0.6B",
                 port=args.port_base - 1,
                 benchmarks=args.benchmarks, limit=args.limit,
+                gpu_mem_util=args.gpu_mem_util, cuda_device=args.cuda_device,
             )
             with open(OUT / "eval_bf16.json", "w") as f:
                 json.dump(baselines[label], f, indent=2)
@@ -216,6 +228,7 @@ def main():
                 "ptq", naive_dir,
                 port=args.port_base - 2,
                 benchmarks=args.benchmarks, limit=args.limit,
+                gpu_mem_util=args.gpu_mem_util, cuda_device=args.cuda_device,
             )
             with open(OUT / "eval_ptq.json", "w") as f:
                 json.dump(baselines[label], f, indent=2)
@@ -228,7 +241,9 @@ def main():
         print(f"\n=== alpha = {alpha} ({i+1}/{len(args.alphas)}) ===")
         ckpt = build_smooth_ckpt(alpha)
         scores = evaluate(label, ckpt, port=args.port_base + i,
-                          benchmarks=args.benchmarks, limit=args.limit)
+                          benchmarks=args.benchmarks, limit=args.limit,
+                          gpu_mem_util=args.gpu_mem_util,
+                          cuda_device=args.cuda_device)
         with open(OUT / f"eval_{label}.json", "w") as f:
             json.dump(scores, f, indent=2)
         alpha_results.append((alpha, label, scores))

@@ -55,7 +55,13 @@ DEFAULT_BENCHMARKS = ["arc", "gsm8k"]
 
 def start_vllm(model_path: str, port: int, label: str,
                max_model_len: int = 2048,
-               gpu_mem_util: float = 0.5) -> subprocess.Popen:
+               gpu_mem_util: float = 0.5,
+               cuda_visible_devices: str = None) -> subprocess.Popen:
+    """Spawn a vLLM OpenAI-compatible server.
+
+    cuda_visible_devices: pass through to CUDA_VISIBLE_DEVICES env var
+    (e.g. "0", "1", "0,1"). Falls back to env $HIFP8_CUDA_DEVICE, then "0".
+    """
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
         "--model", model_path,
@@ -68,10 +74,15 @@ def start_vllm(model_path: str, port: int, label: str,
         "--disable-log-requests",
     ]
     log_file = open(LOGS / f"vllm_server_{label}.log", "w")
-    print(f"  [server] starting {label} on :{port} (log: {log_file.name})")
+    print(f"  [server] starting {label} on :{port} (log: {log_file.name}, "
+          f"gpu_mem_util={gpu_mem_util})")
+    visible = (cuda_visible_devices
+               or os.environ.get("HIFP8_CUDA_DEVICE")
+               or "0")
     proc = subprocess.Popen(
         cmd, stdout=log_file, stderr=subprocess.STDOUT,
-        preexec_fn=os.setsid, env={**os.environ, "CUDA_VISIBLE_DEVICES": "0"},
+        preexec_fn=os.setsid,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": visible},
     )
     return proc
 
