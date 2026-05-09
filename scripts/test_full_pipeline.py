@@ -380,6 +380,96 @@ def _save_results(results: dict, output_dir: str) -> str:
     return out_path
 
 
-if __name__ == "__main__":
+def main():
     args = parse_args()
-    print(f"[Pipeline] model={args.model}  modes={args.modes}  arc-n={args.arc_n}")
+    output_dir = Path(args.output_dir)
+    log_dir = output_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[Pipeline] model={args.model}")
+    print(f"[Pipeline] modes={args.modes}  arc-n={args.arc_n}")
+    print(f"[Pipeline] output={output_dir}")
+
+    # Stage 1: Quantize (skip if only running baseline)
+    model, tokenizer = None, None
+    if any(m != "baseline" for m in args.modes):
+        model, tokenizer = _quantize_model(args.model)
+
+    # Stage 2: Export
+    exports = _export_all(
+        model=model,
+        tokenizer=tokenizer,
+        output_dir=str(output_dir),
+        model_path=args.model,
+        modes=args.modes,
+        skip_export=args.skip_export,
+    )
+
+    # Free GPU memory before serving
+    if model is not None:
+        import torch
+        del model
+        torch.cuda.empty_cache()
+
+    # Stage 3 + 4 (interleaved per mode): serve -> benchmark -> kill
+    all_results = {}
+    for mode in args.modes:
+        if mode not in exports:
+            print(f"[Pipeline] Skipping {mode} (export failed)")
+            continue
+
+        model_dir = exports[mode]
+        print(f"\n{'='*60}")
+        print(f"[Pipeline] Mode: {mode}  dir={model_dir}")
+        print(f"{'='*60}")
+
+        proc = None
+        try:
+            proc = _start_vllm(mode, model_dir, args.port, args.gpu,
+                               str(log_dir))
+            if not _wait_for_health(args.port, args.vllm_startup_timeout, mode):
+                log_path = log_dir / f"vllm_{mode}.log"
+                if log_path.exists():
+                    lines = log_path.read_text().splitlines()
+                    print("[Server] Last 30 lines of server log:")
+                    print("\n".join(lines[-30:]))
+                all_results[mode] = {"error": "Server failed to start"}
+                continue
+
+            arc_work_dir = str(output_dir / "arc_results" / mode)
+            result = _run_arc_benchmark(
+                model_name=mode,
+                port=args.port,
+                arc_n=args.arc_n,
+                work_dir=arc_work_dir,
+                dataset_hub=args.dataset_hub,
+            )
+            all_results[mode] = result
+
+        except Exception as e:
+            print(f"[Pipeline] ERROR in mode {mode}: {e}")
+            all_results[mode] = {"error": str(e)}
+        finally:
+            if proc:
+                _kill_server(proc, mode)
+            time.sleep(5)  # Let GPU memory release
+
+    # Stage 4: Report
+    print(f"\n{'='*60}")
+    print("RESULTS")
+    print("="*60)
+    print(_format_table(all_results))
+
+    results_path = _save_results(all_results, str(output_dir))
+    print(f"\nResults saved to: {results_path}")
+
+    failed = sum(
+        1 for v in all_results.values()
+        if isinstance(v, dict) and "error" in v
+    )
+    if failed == len(all_results):
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
