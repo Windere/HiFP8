@@ -269,6 +269,61 @@ def _kill_server(proc: subprocess.Popen, name: str):
                 pass
 
 
+def _run_arc_benchmark(model_name: str, port: int, arc_n: int,
+                       work_dir: str, dataset_hub: str) -> dict:
+    """Run evalscope ARC benchmark as subprocess; return parsed accuracy dict."""
+    cmd = [
+        sys.executable, "-m", "evalscope.run",
+        "--model", model_name,
+        "--api-url", f"http://localhost:{port}/v1",
+        "--api-key", "EMPTY",
+        "--datasets", "arc",
+        "--dataset-hub", dataset_hub,
+        "--work-dir", work_dir,
+        "--no-timestamp",
+        "--seed", "42",
+        "--limit", str(arc_n),
+    ]
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = (f"{PROJECT_ROOT}:{PROJECT_ROOT / 'ao'}:"
+                         f"{env.get('PYTHONPATH', '')}")
+    env["HF_HOME"] = "/home/data/.cache/huggingface"
+    env["MODELSCOPE_CACHE"] = "/home/data/.cache/modelscope"
+
+    print(f"[Benchmark] Running ARC for {model_name} (limit={arc_n})")
+    try:
+        r = subprocess.run(cmd, env=env, capture_output=True,
+                           text=True, timeout=3600)
+    except subprocess.TimeoutExpired:
+        return {"error": "benchmark timed out after 3600s"}
+
+    if r.returncode != 0:
+        print(f"[Benchmark] STDERR: {r.stderr[-1000:]}")
+        return {"error": r.stderr[-500:]}
+
+    return _parse_arc_results(work_dir)
+
+
+def _parse_arc_results(work_dir: str) -> dict:
+    """Scan work_dir JSON files for the first accuracy/score metric."""
+    results = {}
+    for json_file in Path(work_dir).rglob("*.json"):
+        try:
+            with open(json_file) as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                continue
+            for key in ("accuracy", "acc", "score", "ARC-Easy", "ARC-Challenge"):
+                if key in data:
+                    results[key] = data[key]
+            if "results" in data and isinstance(data["results"], dict):
+                results.update(data["results"])
+        except Exception:
+            continue
+    return results
+
+
 if __name__ == "__main__":
     args = parse_args()
     print(f"[Pipeline] model={args.model}  modes={args.modes}  arc-n={args.arc_n}")

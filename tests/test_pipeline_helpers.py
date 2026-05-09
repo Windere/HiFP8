@@ -71,3 +71,29 @@ def test_build_vllm_cmd_uint8_uses_v4_server():
     cmd = _build_vllm_cmd("uint8", "/tmp/model", 8010, "0")
     joined = " ".join(cmd)
     assert "start_vllm_hifp8_server_v4.py" in joined
+
+
+import tempfile
+from pathlib import Path as _Path
+
+
+def _write_json(path, data):
+    _Path(path).parent.mkdir(parents=True, exist_ok=True)
+    import json as _json
+    with open(path, "w") as f:
+        _json.dump(data, f)
+
+
+def test_parse_arc_results_finds_accuracy(tmp_path):
+    from scripts.test_full_pipeline import _parse_arc_results
+    _write_json(tmp_path / "reports" / "arc_e.json",
+                {"accuracy": 0.623, "num_examples": 100})
+    result = _parse_arc_results(str(tmp_path))
+    assert "accuracy" in result
+    assert abs(result["accuracy"] - 0.623) < 1e-6
+
+
+def test_parse_arc_results_empty_dir(tmp_path):
+    from scripts.test_full_pipeline import _parse_arc_results
+    result = _parse_arc_results(str(tmp_path))
+    assert result == {}
