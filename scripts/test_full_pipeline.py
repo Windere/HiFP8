@@ -91,6 +91,93 @@ def _quantize_model(model_path: str):
     return model, tokenizer
 
 
+def _export_dir(output_dir: str, mode: str) -> Path:
+    return Path(output_dir) / mode
+
+
+def _export_all(
+    model,
+    tokenizer,
+    output_dir: str,
+    model_path: str,
+    modes: list,
+    skip_export: bool = False,
+) -> dict:
+    """
+    Export model in all requested modes.
+    Returns dict mapping mode -> export directory path (str).
+    'baseline' always maps to model_path (original, no copy).
+    """
+    from export.bf16_export import export_bf16_for_vllm
+    from export.uint8_export import export_uint8_for_vllm
+    from export.hif8_export import export_for_hif8_vllm
+
+    exports = {}
+    for mode in modes:
+        if mode == "baseline":
+            exports["baseline"] = model_path
+            print("[Export] baseline -> using original model path (no copy)")
+            continue
+
+        out = str(_export_dir(output_dir, mode))
+        if skip_export and Path(out).exists():
+            print(f"[Export] {mode} -> reusing {out}")
+            exports[mode] = out
+            continue
+
+        print(f"[Export] {mode} -> {out}")
+        try:
+            if mode == "bf16":
+                exports[mode] = export_bf16_for_vllm(model, tokenizer, out)
+            elif mode == "uint8":
+                exports[mode] = export_uint8_for_vllm(model, tokenizer, out)
+                _decode_uint8_to_bf16(out)
+            elif mode == "hif8":
+                exports[mode] = export_for_hif8_vllm(model, tokenizer, out)
+            else:
+                print(f"[Export] Unknown mode {mode!r}, skipping")
+        except Exception as e:
+            print(f"[Export] ERROR in mode {mode}: {e}")
+    return exports
+
+
+def _decode_uint8_to_bf16(uint8_dir: str):
+    """Decode uint8 safetensors back to BF16 so standard vLLM can serve it."""
+    import torch
+    from safetensors.torch import load_file, save_file
+    from custom_ops.hifp8_uint8_ops import hifp8_decode_uint8, HAS_CUDA_KERNELS
+
+    st_path = Path(uint8_dir) / "model.safetensors"
+    if not st_path.exists():
+        return
+
+    state_dict = load_file(str(st_path))
+    new_sd = {}
+    decoded = 0
+
+    for key, tensor in state_dict.items():
+        if key.endswith(".weight_uint8"):
+            layer = key.replace(".weight_uint8", "")
+            scale_key = f"{layer}.weight_scale"
+            if scale_key in state_dict:
+                if not HAS_CUDA_KERNELS:
+                    raise RuntimeError(
+                        "CUDA kernels required to decode uint8 HiFloat8"
+                    )
+                w = hifp8_decode_uint8(
+                    tensor.cuda(), state_dict[scale_key].cuda(),
+                    output_dtype=torch.bfloat16,
+                )
+                new_sd[f"{layer}.weight"] = w.cpu()
+                decoded += 1
+        elif not key.endswith(".weight_scale"):
+            new_sd[key] = tensor
+
+    print(f"[Decode] {decoded} layers decoded uint8 -> BF16")
+    save_file(new_sd, str(st_path))
+    torch.cuda.empty_cache()
+
+
 if __name__ == "__main__":
     args = parse_args()
     print(f"[Pipeline] model={args.model}  modes={args.modes}  arc-n={args.arc_n}")
