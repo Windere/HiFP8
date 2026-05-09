@@ -229,9 +229,11 @@ def _start_vllm(mode: str, model_path: str, port: int, gpu: str,
 
     cmd = _build_vllm_cmd(mode, model_path, port, gpu)
     print(f"[Server] Starting {mode} on port {port}  log: {log_path}")
-    return subprocess.Popen(cmd, env=env,
+    proc = subprocess.Popen(cmd, env=env,
                             stdout=log_fh, stderr=subprocess.STDOUT,
                             preexec_fn=os.setsid)
+    log_fh.close()
+    return proc
 
 
 def _wait_for_health(port: int, timeout: int, name: str) -> bool:
@@ -254,11 +256,15 @@ def _kill_server(proc: subprocess.Popen, name: str):
     if proc and proc.poll() is None:
         print(f"[Server] Stopping {name}...")
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            pgid = os.getpgid(proc.pid)
+        except OSError:
+            return  # process already dead
+        try:
+            os.killpg(pgid, signal.SIGTERM)
             proc.wait(timeout=15)
         except Exception:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                os.killpg(pgid, signal.SIGKILL)
             except Exception:
                 pass
 
