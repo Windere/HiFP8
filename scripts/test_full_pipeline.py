@@ -130,8 +130,9 @@ def _export_all(
             if mode == "bf16":
                 exports[mode] = export_bf16_for_vllm(model, tokenizer, out)
             elif mode == "uint8":
-                exports[mode] = export_uint8_for_vllm(model, tokenizer, out)
+                _uint8_path = export_uint8_for_vllm(model, tokenizer, out)
                 _decode_uint8_to_bf16(out)
+                exports[mode] = _uint8_path  # Only reached if decode succeeded
             elif mode == "hif8":
                 exports[mode] = export_for_hif8_vllm(model, tokenizer, out)
             else:
