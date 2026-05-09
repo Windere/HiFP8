@@ -306,22 +306,25 @@ def _run_arc_benchmark(model_name: str, port: int, arc_n: int,
 
 
 def _parse_arc_results(work_dir: str) -> dict:
-    """Scan work_dir JSON files for the first accuracy/score metric."""
-    results = {}
+    """Scan work_dir JSON files for the first file that contains a metric key."""
+    metric_keys = ("accuracy", "acc", "score", "ARC-Easy", "ARC-Challenge")
     for json_file in Path(work_dir).rglob("*.json"):
         try:
             with open(json_file) as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 continue
-            for key in ("accuracy", "acc", "score", "ARC-Easy", "ARC-Challenge"):
-                if key in data:
-                    results[key] = data[key]
+            found = {k: data[k] for k in metric_keys if k in data}
             if "results" in data and isinstance(data["results"], dict):
-                results.update(data["results"])
-        except Exception:
+                for k in metric_keys:
+                    if k in data["results"] and k not in found:
+                        found[k] = data["results"][k]
+            if found:
+                return found
+        except Exception as e:
+            print(f"[Parse] Warning: could not parse {json_file}: {e}")
             continue
-    return results
+    return {}
 
 
 def _format_table(results: dict) -> str:
@@ -335,7 +338,7 @@ def _format_table(results: dict) -> str:
     lines = [sep, header, sep]
 
     for mode, data in results.items():
-        if isinstance(data, dict) and "accuracy" in data:
+        if isinstance(data, dict) and "accuracy" in data and isinstance(data["accuracy"], (int, float)):
             acc = data["accuracy"]
             acc_str = f"{acc * 100:.1f} %"
             if baseline_acc is not None and mode != "baseline":
@@ -358,14 +361,20 @@ def _save_results(results: dict, output_dir: str) -> str:
     out_path = str(Path(output_dir) / "results.json")
     serializable = {}
     for k, v in results.items():
-        serializable[k] = {}
         if isinstance(v, dict):
+            serializable[k] = {}
             for kk, vv in v.items():
                 try:
                     json.dumps(vv)
                     serializable[k][kk] = vv
                 except (TypeError, ValueError):
                     serializable[k][kk] = str(vv)
+        else:
+            try:
+                json.dumps(v)
+                serializable[k] = v
+            except (TypeError, ValueError):
+                serializable[k] = str(v)
     with open(out_path, "w") as f:
         json.dump(serializable, f, indent=2, ensure_ascii=False)
     return out_path
