@@ -37,3 +37,37 @@ def test_export_dir_names():
     assert _export_dir("/tmp/out", "baseline") == Path("/tmp/out/baseline")
     assert _export_dir("/tmp/out", "bf16") == Path("/tmp/out/bf16")
     assert _export_dir("/tmp/out", "hif8") == Path("/tmp/out/hif8")
+
+
+def test_build_vllm_cmd_baseline():
+    from scripts.test_full_pipeline import _build_vllm_cmd
+    cmd = _build_vllm_cmd("baseline", "/tmp/model", 8010, "0")
+    assert "-m" in cmd
+    assert "vllm.entrypoints.openai.api_server" in cmd
+    assert "--model" in cmd
+    assert "/tmp/model" in cmd
+    assert "start_vllm_hifp8_server_v4.py" not in " ".join(cmd)
+
+
+def test_build_vllm_cmd_bf16_uses_v4_server():
+    from scripts.test_full_pipeline import _build_vllm_cmd
+    cmd = _build_vllm_cmd("bf16", "/tmp/model", 8010, "0")
+    joined = " ".join(cmd)
+    assert "start_vllm_hifp8_server_v4.py" in joined
+    assert "/tmp/model" in joined
+
+
+def test_build_vllm_cmd_hif8_uses_quantization_flag():
+    from scripts.test_full_pipeline import _build_vllm_cmd
+    cmd = _build_vllm_cmd("hif8", "/tmp/model", 8010, "0")
+    assert "--quantization" in cmd
+    idx = cmd.index("--quantization")
+    assert cmd[idx + 1] == "hif8"
+    assert "start_vllm_hifp8_server_v4.py" not in " ".join(cmd)
+
+
+def test_build_vllm_cmd_uint8_uses_v4_server():
+    from scripts.test_full_pipeline import _build_vllm_cmd
+    cmd = _build_vllm_cmd("uint8", "/tmp/model", 8010, "0")
+    joined = " ".join(cmd)
+    assert "start_vllm_hifp8_server_v4.py" in joined

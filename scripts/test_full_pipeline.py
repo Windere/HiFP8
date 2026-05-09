@@ -179,6 +179,90 @@ def _decode_uint8_to_bf16(uint8_dir: str):
     torch.cuda.empty_cache()
 
 
+V4_SERVER = str(PROJECT_ROOT / "scripts" / "start_vllm_hifp8_server_v4.py")
+_VLLM_COMMON_ARGS = [
+    "--dtype", "bfloat16",
+    "--max-model-len", "2048",
+    "--gpu-memory-utilization", "0.5",
+    "--trust-remote-code",
+    "--disable-log-requests",
+]
+
+
+def _build_vllm_cmd(mode: str, model_path: str, port: int, gpu: str) -> list:
+    """Return subprocess command list to launch vLLM for the given mode."""
+    base = [sys.executable]
+    if mode in ("bf16", "uint8"):
+        # BF16: needs monkey-patch loader from v4 server.
+        # uint8: was decoded to BF16 in export step but has hifp8_metadata.json;
+        #        v4 server auto-detects both cases.
+        cmd = base + [V4_SERVER,
+                      "--model", model_path,
+                      "--port", str(port),
+                      "--served-model-name", mode]
+    elif mode == "hif8":
+        # vLLM fork native HiF8 support via --quantization flag.
+        cmd = base + ["-m", "vllm.entrypoints.openai.api_server",
+                      "--model", model_path,
+                      "--port", str(port),
+                      "--served-model-name", mode,
+                      "--quantization", "hif8"]
+    else:  # baseline
+        cmd = base + ["-m", "vllm.entrypoints.openai.api_server",
+                      "--model", model_path,
+                      "--port", str(port),
+                      "--served-model-name", mode]
+    return cmd + _VLLM_COMMON_ARGS
+
+
+def _start_vllm(mode: str, model_path: str, port: int, gpu: str,
+                log_dir: str) -> subprocess.Popen:
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = gpu
+    env["PYTHONPATH"] = (f"{PROJECT_ROOT}:{PROJECT_ROOT / 'ao'}:"
+                         f"{env.get('PYTHONPATH', '')}")
+    env["HIFP8_MODEL_PATH"] = model_path
+
+    log_path = Path(log_dir) / f"vllm_{mode}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_fh = open(log_path, "w")
+
+    cmd = _build_vllm_cmd(mode, model_path, port, gpu)
+    print(f"[Server] Starting {mode} on port {port}  log: {log_path}")
+    return subprocess.Popen(cmd, env=env,
+                            stdout=log_fh, stderr=subprocess.STDOUT,
+                            preexec_fn=os.setsid)
+
+
+def _wait_for_health(port: int, timeout: int, name: str) -> bool:
+    url = f"http://localhost:{port}/health"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            r = urllib.request.urlopen(url, timeout=3)
+            if r.status == 200:
+                print(f"[Server] {name} ready on port {port}")
+                return True
+        except Exception:
+            pass
+        time.sleep(3)
+    print(f"[Server] {name} did not start within {timeout}s")
+    return False
+
+
+def _kill_server(proc: subprocess.Popen, name: str):
+    if proc and proc.poll() is None:
+        print(f"[Server] Stopping {name}...")
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            proc.wait(timeout=15)
+        except Exception:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
     args = parse_args()
     print(f"[Pipeline] model={args.model}  modes={args.modes}  arc-n={args.arc_n}")
