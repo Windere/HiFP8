@@ -324,6 +324,53 @@ def _parse_arc_results(work_dir: str) -> dict:
     return results
 
 
+def _format_table(results: dict) -> str:
+    baseline_acc = None
+    baseline = results.get("baseline")
+    if isinstance(baseline, dict) and "accuracy" in baseline:
+        baseline_acc = baseline["accuracy"]
+
+    header = f"{'Mode':<16} {'ARC-E acc':>10} {'vs baseline':>12}"
+    sep = "-" * len(header)
+    lines = [sep, header, sep]
+
+    for mode, data in results.items():
+        if isinstance(data, dict) and "accuracy" in data:
+            acc = data["accuracy"]
+            acc_str = f"{acc * 100:.1f} %"
+            if baseline_acc is not None and mode != "baseline":
+                delta = (acc - baseline_acc) * 100
+                delta_str = f"{delta:+.1f} pp"
+            else:
+                delta_str = "—"
+        else:
+            err = data.get("error", "N/A") if isinstance(data, dict) else "N/A"
+            acc_str = f"ERR: {str(err)[:18]}"
+            delta_str = "N/A"
+        lines.append(f"{mode:<16} {acc_str:>10} {delta_str:>12}")
+
+    lines.append(sep)
+    return "\n".join(lines)
+
+
+def _save_results(results: dict, output_dir: str) -> str:
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    out_path = str(Path(output_dir) / "results.json")
+    serializable = {}
+    for k, v in results.items():
+        serializable[k] = {}
+        if isinstance(v, dict):
+            for kk, vv in v.items():
+                try:
+                    json.dumps(vv)
+                    serializable[k][kk] = vv
+                except (TypeError, ValueError):
+                    serializable[k][kk] = str(vv)
+    with open(out_path, "w") as f:
+        json.dump(serializable, f, indent=2, ensure_ascii=False)
+    return out_path
+
+
 if __name__ == "__main__":
     args = parse_args()
     print(f"[Pipeline] model={args.model}  modes={args.modes}  arc-n={args.arc_n}")

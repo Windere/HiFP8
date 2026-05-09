@@ -97,3 +97,29 @@ def test_parse_arc_results_empty_dir(tmp_path):
     from scripts.test_full_pipeline import _parse_arc_results
     result = _parse_arc_results(str(tmp_path))
     assert result == {}
+
+
+def test_format_table_shows_all_modes():
+    from scripts.test_full_pipeline import _format_table
+    results = {
+        "baseline": {"accuracy": 0.623},
+        "bf16":     {"accuracy": 0.618},
+        "uint8":    {"accuracy": 0.615},
+        "hif8":     {"accuracy": 0.612},
+    }
+    table = _format_table(results)
+    assert "baseline" in table
+    assert "bf16" in table
+    assert "62.3" in table
+    assert "61.8" in table
+
+
+def test_format_table_handles_missing_accuracy():
+    from scripts.test_full_pipeline import _format_table
+    results = {
+        "baseline": {"accuracy": 0.623},
+        "bf16":     {"error": "Server failed"},
+    }
+    table = _format_table(results)
+    assert "bf16" in table
+    assert any(x in table for x in ("ERR", "N/A", "error"))
