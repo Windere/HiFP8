@@ -23,3 +23,9 @@ def test_parse_args_custom_modes(monkeypatch):
                                       "--modes", "baseline,bf16"])
     args = parse_args()
     assert args.modes == ["baseline", "bf16"]
+
+
+def test_calibration_prompts_nonempty():
+    from scripts.test_full_pipeline import CALIBRATION_PROMPTS
+    assert len(CALIBRATION_PROMPTS) >= 4
+    assert all(isinstance(p, str) and len(p) > 10 for p in CALIBRATION_PROMPTS)

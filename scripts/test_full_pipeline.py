@@ -47,6 +47,50 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+CALIBRATION_PROMPTS = [
+    "The quick brown fox jumps over the lazy dog.",
+    "In 2024, artificial intelligence made significant advances in reasoning.",
+    "Quantization reduces model size by representing weights with fewer bits.",
+    "The transformer architecture revolutionized natural language processing.",
+    "Large language models are trained on vast amounts of text data.",
+    "Scientific research requires careful experimental design and analysis.",
+]
+
+
+def _quantize_model(model_path: str):
+    """Load model, apply HiFP8 fake-quant (w8a8), run calibration forward passes."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from quantization.hifp8_linear import prepare_hifp8_fake_quant
+    from quantization.hifp8_config import HiFP8FakeQuantizeConfig
+
+    print(f"[Quantize] Loading {model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="cuda:0",
+        trust_remote_code=True,
+    )
+
+    print("[Quantize] Applying HiFP8 fake-quant (w8a8)...")
+    model = prepare_hifp8_fake_quant(
+        model,
+        weight_config=HiFP8FakeQuantizeConfig(),
+        activation_config=HiFP8FakeQuantizeConfig(),
+    )
+
+    print("[Quantize] Calibrating with fixed prompts...")
+    model.train()
+    with torch.no_grad():
+        for prompt in CALIBRATION_PROMPTS:
+            inputs = tokenizer(prompt, return_tensors="pt").to("cuda:0")
+            model(**inputs)
+    model.eval()
+    print("[Quantize] Done.")
+    return model, tokenizer
+
+
 if __name__ == "__main__":
     args = parse_args()
     print(f"[Pipeline] model={args.model}  modes={args.modes}  arc-n={args.arc_n}")
