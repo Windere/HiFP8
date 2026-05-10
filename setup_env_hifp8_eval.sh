@@ -41,6 +41,19 @@ else
 fi
 conda activate "${ENV_NAME}"
 
+# Ensure torch shared libs are findable at import time.
+# conda activate does not add site-packages/torch/lib to LD_LIBRARY_PATH;
+# without this, any python -c "import hifp8_cuda_uint8" fails with
+# "libc10.so: cannot open shared object file".
+_set_torch_ldpath() {
+    local torch_lib
+    torch_lib=$(python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__),'lib'))" 2>/dev/null)
+    if [ -n "${torch_lib}" ] && [ -d "${torch_lib}" ]; then
+        export LD_LIBRARY_PATH="${torch_lib}:${LD_LIBRARY_PATH:-}"
+        run_log "[setup] LD_LIBRARY_PATH += ${torch_lib}"
+    fi
+}
+
 # 2) torch 2.9.0 + cu128 — matches RTX 5090 driver 570.x (CUDA 12.8 runtime).
 # torch 2.11.0+cu130 needs driver ≥ CUDA 13, which most production hosts
 # don't have yet. Override HIFP8_TORCH_* env vars to use a different combo.
@@ -52,6 +65,7 @@ python -m pip install --quiet \
     "torch==${TORCH_VER}" "torchvision==${TORCHVISION_VER}" \
     --extra-index-url "${TORCH_INDEX}" \
     2>&1 | tee -a "${LOG_DIR}/setup.log"
+_set_torch_ldpath
 
 # 3) HiFP8 modeling stack
 run_log "[setup] Installing transformers / datasets / accelerate / sentencepiece / en-dtypes / torchao..."

@@ -44,6 +44,29 @@ def parse_args() -> argparse.Namespace:
                    choices=["modelscope", "huggingface"])
     p.add_argument("--skip-export", action="store_true",
                    help="Reuse existing exports in output-dir")
+    p.add_argument("--scale-factor", type=float, default=16.0,
+                   help="HiFP8 scale_factor: scale = row_amax / scale_factor. "
+                        "Bulk weight values land in LUT exponent zone log2(scale_factor)-3 "
+                        "to log2(scale_factor); 16.0 (default) puts bulk in the densest "
+                        "[-3,+3]-exponent zone (8 levels/octave) AND aligns with the fork's "
+                        "activation scale_target=16. sf=1 was the old default but hides "
+                        "small-magnitude weights in the 4-lev/oct subnormal zone. "
+                        "sf>32 pushes amax into 4-lev/oct or 2-lev/oct (degrades sharply).")
+    p.add_argument("--smooth-quant", action="store_true",
+                   help="Apply SmoothQuant before HiFP8 export to reduce "
+                        "activation-quantization error in hif8 mode")
+    p.add_argument("--smooth-alpha", type=float, default=0.7,
+                   help="SmoothQuant alpha in [0,1]. s = x_amax^alpha / w_amax^(1-alpha). "
+                        "Default 0.7 (empirically best on Qwen3-0.6B with sf=16 — see "
+                        "outputs/sweep_2d_*.json). Alpha is a weak lever (alpha 0.5-0.8 "
+                        "all within ~5% of each other); scale_factor matters far more. "
+                        "Only used when --smooth-quant is set.")
+    p.add_argument("--no-thinking", action="store_true",
+                   help="Pass enable_thinking=false to evalscope generation config "
+                        "(matches README evaluation methodology)")
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.5,
+                   help="vLLM gpu-memory-utilization (default 0.5). Lower this if other "
+                        "GPU processes are running concurrently.")
     return p.parse_args()
 
 
@@ -57,8 +80,9 @@ CALIBRATION_PROMPTS = [
 ]
 
 
-def _quantize_model(model_path: str):
-    """Load model, apply HiFP8 fake-quant (w8a8), run calibration forward passes."""
+def _quantize_model(model_path: str, scale_factor: float = 1.0,
+                    smooth_quant: bool = False, smooth_alpha: float = 0.5):
+    """Load model, apply SmoothQuant (optional) + HiFP8 fake-quant (w8a8)."""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from quantization.hifp8_linear import prepare_hifp8_fake_quant
@@ -73,12 +97,33 @@ def _quantize_model(model_path: str):
         trust_remote_code=True,
     )
 
-    print("[Quantize] Applying HiFP8 fake-quant (w8a8)...")
+    print(f"[Quantize] Applying HiFP8 fake-quant (w8a8, scale_factor={scale_factor})...")
+    cfg = HiFP8FakeQuantizeConfig(scale_factor=scale_factor)
     model = prepare_hifp8_fake_quant(
         model,
-        weight_config=HiFP8FakeQuantizeConfig(),
-        activation_config=HiFP8FakeQuantizeConfig(),
+        weight_config=cfg,
+        activation_config=cfg,
     )
+
+    if smooth_quant:
+        from quantization.smooth import calibrate_and_smooth
+        from quantization.smooth_fuse import fuse_smooth_into_norms, rollback_unfoldable_smooths
+
+        print("[SmoothQuant] Building calibration dataloader from fixed prompts...")
+        encoded = [tokenizer(p, return_tensors="pt") for p in CALIBRATION_PROMPTS]
+
+        class _SimpleLoader:
+            def __iter__(self):
+                for batch in encoded:
+                    yield {k: v.to("cuda:0") for k, v in batch.items()}
+
+        print(f"[SmoothQuant] alpha={smooth_alpha}")
+        calibrate_and_smooth(model, _SimpleLoader(), alpha=smooth_alpha,
+                             num_batches=len(CALIBRATION_PROMPTS))
+        print("[SmoothQuant] Fusing smooth scales into RMSNorm weights...")
+        fuse_smooth_into_norms(model)
+        rollback_unfoldable_smooths(model)
+        print("[SmoothQuant] Done.")
 
     print("[Quantize] Calibrating with fixed prompts...")
     model.train()
@@ -102,6 +147,7 @@ def _export_all(
     model_path: str,
     modes: list,
     skip_export: bool = False,
+    hif8_scale_factor: float = 16.0,
 ) -> dict:
     """
     Export model in all requested modes.
@@ -130,11 +176,18 @@ def _export_all(
             if mode == "bf16":
                 exports[mode] = export_bf16_for_vllm(model, tokenizer, out)
             elif mode == "uint8":
-                _uint8_path = export_uint8_for_vllm(model, tokenizer, out)
+                # Export real uint8 weights, then pre-decode to BF16 for serving.
+                # The V4 server monkey-patch runs in the main process but vLLM v1
+                # loads weights in an EngineCore subprocess — the patch never takes
+                # effect there. Pre-decoding here lets standard vLLM serve the result.
+                export_uint8_for_vllm(model, tokenizer, out)
                 _decode_uint8_to_bf16(out)
-                exports[mode] = _uint8_path  # Only reached if decode succeeded
+                exports[mode] = out
             elif mode == "hif8":
-                exports[mode] = export_for_hif8_vllm(model, tokenizer, out)
+                exports[mode] = export_for_hif8_vllm(
+                    model, tokenizer, out,
+                    scale_factor=hif8_scale_factor,
+                )
             else:
                 print(f"[Export] Unknown mode {mode!r}, skipping")
         except Exception as e:
@@ -183,51 +236,73 @@ V4_SERVER = str(PROJECT_ROOT / "scripts" / "start_vllm_hifp8_server_v4.py")
 _VLLM_COMMON_ARGS = [
     "--dtype", "bfloat16",
     "--max-model-len", "2048",
-    "--gpu-memory-utilization", "0.5",
     "--trust-remote-code",
     "--disable-log-requests",
 ]
 
 
-def _build_vllm_cmd(mode: str, model_path: str, port: int, gpu: str) -> list:
+def _build_vllm_cmd(mode: str, model_path: str, port: int, gpu: str,
+                    gpu_memory_utilization: float = 0.5) -> list:
     """Return subprocess command list to launch vLLM for the given mode."""
     base = [sys.executable]
-    if mode in ("bf16", "uint8"):
-        # BF16: needs monkey-patch loader from v4 server.
-        # uint8: was decoded to BF16 in export step but has hifp8_metadata.json;
-        #        v4 server auto-detects both cases.
+    if mode == "bf16":
+        # V4 server patches vLLM linear layers for HiF8 fake-quant at load time.
         cmd = base + [V4_SERVER,
                       "--model", model_path,
                       "--port", str(port),
                       "--served-model-name", mode]
+    elif mode == "uint8":
+        # uint8 weights are pre-decoded to BF16 before serving (V4 server hook
+        # doesn't propagate to vLLM v1's EngineCore subprocess). Standard vLLM
+        # loads the decoded BF16 weights directly.
+        cmd = base + ["-m", "vllm.entrypoints.openai.api_server",
+                      "--model", model_path,
+                      "--port", str(port),
+                      "--served-model-name", mode]
     elif mode == "hif8":
-        # vLLM fork native HiF8 support via --quantization flag.
+        # HiF8 native quantization via vLLM fork.
+        # --enforce-eager disables torch.compile: the custom _hif8_cuda pybind11
+        # kernel is not Dynamo-traceable, causing engine core initialization failure.
         cmd = base + ["-m", "vllm.entrypoints.openai.api_server",
                       "--model", model_path,
                       "--port", str(port),
                       "--served-model-name", mode,
-                      "--quantization", "hif8"]
+                      "--quantization", "hif8",
+                      "--enforce-eager"]
     else:  # baseline
         cmd = base + ["-m", "vllm.entrypoints.openai.api_server",
                       "--model", model_path,
                       "--port", str(port),
                       "--served-model-name", mode]
-    return cmd + _VLLM_COMMON_ARGS
+    gpu_mem_args = ["--gpu-memory-utilization", str(gpu_memory_utilization)]
+    return cmd + _VLLM_COMMON_ARGS + gpu_mem_args
+
+
+def _torch_lib_path() -> str:
+    import importlib.util
+    spec = importlib.util.find_spec("torch")
+    if spec and spec.origin:
+        return str(Path(spec.origin).parent / "lib")
+    return ""
 
 
 def _start_vllm(mode: str, model_path: str, port: int, gpu: str,
-                log_dir: str) -> subprocess.Popen:
+                log_dir: str, gpu_memory_utilization: float = 0.5) -> subprocess.Popen:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu
     env["PYTHONPATH"] = (f"{PROJECT_ROOT}:{PROJECT_ROOT / 'ao'}:"
+                         f"{PROJECT_ROOT / 'custom_ops'}:"
                          f"{env.get('PYTHONPATH', '')}")
     env["HIFP8_MODEL_PATH"] = model_path
+    torch_lib = _torch_lib_path()
+    if torch_lib:
+        env["LD_LIBRARY_PATH"] = f"{torch_lib}:{env.get('LD_LIBRARY_PATH', '')}"
 
     log_path = Path(log_dir) / f"vllm_{mode}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(log_path, "w")
 
-    cmd = _build_vllm_cmd(mode, model_path, port, gpu)
+    cmd = _build_vllm_cmd(mode, model_path, port, gpu, gpu_memory_utilization)
     print(f"[Server] Starting {mode} on port {port}  log: {log_path}")
     proc = subprocess.Popen(cmd, env=env,
                             stdout=log_fh, stderr=subprocess.STDOUT,
@@ -269,8 +344,28 @@ def _kill_server(proc: subprocess.Popen, name: str):
                 pass
 
 
+def _wait_gpu_free(gpu_id: str, need_mib: int, timeout: int = 120) -> None:
+    """Poll nvidia-smi until physical GPU `gpu_id` has at least `need_mib` MiB free."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=memory.free",
+                 "--format=csv,noheader,nounits", f"--id={gpu_id}"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            free_mib = int(out.splitlines()[0])
+            if free_mib >= need_mib:
+                return
+        except Exception:
+            pass
+        time.sleep(5)
+    print(f"[Server] Warning: GPU {gpu_id} still below {need_mib} MiB free after {timeout}s")
+
+
 def _run_arc_benchmark(model_name: str, port: int, arc_n: int,
-                       work_dir: str, dataset_hub: str) -> dict:
+                       work_dir: str, dataset_hub: str,
+                       no_thinking: bool = False) -> dict:
     """Run evalscope ARC benchmark as subprocess; return parsed accuracy dict."""
     cmd = [
         sys.executable, "-m", "evalscope.run",
@@ -284,19 +379,31 @@ def _run_arc_benchmark(model_name: str, port: int, arc_n: int,
         "--seed", "42",
         "--limit", str(arc_n),
     ]
+    if no_thinking:
+        # Qwen3 thinking is gated by chat_template_kwargs.enable_thinking. The
+        # evalscope GenerateConfig schema doesn't translate top-level unknown
+        # keys to the OpenAI request body — only `extra_body` is forwarded
+        # (see openai_completion_params at evalscope/models/utils/openai.py:213).
+        # The OpenAI Python SDK then flattens extra_body fields to top-level
+        # of the request body, where vLLM picks up chat_template_kwargs.
+        # Cap max_tokens at 256 — non-think ARC answers are 5-50 tokens.
+        cmd += ["--generation-config",
+                '{"extra_body": {"chat_template_kwargs": {"enable_thinking": false}}, '
+                '"max_tokens": 256}']
 
     env = os.environ.copy()
     env["PYTHONPATH"] = (f"{PROJECT_ROOT}:{PROJECT_ROOT / 'ao'}:"
                          f"{env.get('PYTHONPATH', '')}")
-    env["HF_HOME"] = "/home/data/.cache/huggingface"
-    env["MODELSCOPE_CACHE"] = "/home/data/.cache/modelscope"
+    _cache_root = Path.home() / ".cache"
+    env["HF_HOME"] = str(_cache_root / "huggingface")
+    env["MODELSCOPE_CACHE"] = str(_cache_root / "modelscope")
 
     print(f"[Benchmark] Running ARC for {model_name} (limit={arc_n})")
     try:
         r = subprocess.run(cmd, env=env, capture_output=True,
-                           text=True, timeout=3600)
+                           text=True, timeout=7200)
     except subprocess.TimeoutExpired:
-        return {"error": "benchmark timed out after 3600s"}
+        return {"error": "benchmark timed out after 7200s"}
 
     if r.returncode != 0:
         print(f"[Benchmark] STDERR: {r.stderr[-1000:]}")
@@ -306,24 +413,44 @@ def _run_arc_benchmark(model_name: str, port: int, arc_n: int,
 
 
 def _parse_arc_results(work_dir: str) -> dict:
-    """Scan work_dir JSON files for the first file that contains a metric key."""
-    metric_keys = ("accuracy", "acc", "score", "ARC-Easy", "ARC-Challenge")
-    for json_file in Path(work_dir).rglob("*.json"):
+    """Scan work_dir JSON files; return {"accuracy": float} on first match.
+
+    evalscope writes arc.json with top-level "score" and a "metrics" array.
+    We normalize any found accuracy-like value to the "accuracy" key so the
+    rest of the pipeline only needs to handle one canonical name.
+    """
+    _SCORE_KEYS = ("accuracy", "acc", "score", "mean_acc")
+
+    def _extract(data: dict) -> float | None:
+        # Direct top-level key
+        for k in _SCORE_KEYS:
+            if k in data and isinstance(data[k], (int, float)):
+                return float(data[k])
+        # Nested under "results"
+        if isinstance(data.get("results"), dict):
+            for k in _SCORE_KEYS:
+                v = data["results"].get(k)
+                if isinstance(v, (int, float)):
+                    return float(v)
+        # evalscope "metrics" array: [{name: ..., score: ...}]
+        for entry in data.get("metrics", []):
+            if isinstance(entry, dict) and entry.get("name") in _SCORE_KEYS:
+                v = entry.get("score")
+                if isinstance(v, (int, float)):
+                    return float(v)
+        return None
+
+    for json_file in sorted(Path(work_dir).rglob("*.json")):
         try:
             with open(json_file) as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 continue
-            found = {k: data[k] for k in metric_keys if k in data}
-            if "results" in data and isinstance(data["results"], dict):
-                for k in metric_keys:
-                    if k in data["results"] and k not in found:
-                        found[k] = data["results"][k]
-            if found:
-                return found
+            val = _extract(data)
+            if val is not None:
+                return {"accuracy": val}
         except Exception as e:
             print(f"[Parse] Warning: could not parse {json_file}: {e}")
-            continue
     return {}
 
 
@@ -393,7 +520,9 @@ def main():
     # Stage 1: Quantize (skip if only running baseline)
     model, tokenizer = None, None
     if any(m != "baseline" for m in args.modes):
-        model, tokenizer = _quantize_model(args.model)
+        model, tokenizer = _quantize_model(args.model, scale_factor=args.scale_factor,
+                                            smooth_quant=args.smooth_quant,
+                                            smooth_alpha=args.smooth_alpha)
 
     # Stage 2: Export
     exports = _export_all(
@@ -403,13 +532,19 @@ def main():
         model_path=args.model,
         modes=args.modes,
         skip_export=args.skip_export,
+        hif8_scale_factor=args.scale_factor,
     )
 
-    # Free GPU memory before serving
+    # Free GPU memory before serving — synchronize and wait for the CUDA driver
+    # to fully release cached memory. Without this, vLLM's memory profiling
+    # assertion fails because the driver reports increasing free memory (released
+    # by this process) during vLLM's 14-second torch.compile initialization.
     if model is not None:
-        import torch
+        import torch, time
         del model
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
+        time.sleep(5)
 
     # Stage 3 + 4 (interleaved per mode): serve -> benchmark -> kill
     all_results = {}
@@ -426,7 +561,7 @@ def main():
         proc = None
         try:
             proc = _start_vllm(mode, model_dir, args.port, args.gpu,
-                               str(log_dir))
+                               str(log_dir), args.gpu_memory_utilization)
             if not _wait_for_health(args.port, args.vllm_startup_timeout, mode):
                 log_path = log_dir / f"vllm_{mode}.log"
                 if log_path.exists():
@@ -443,6 +578,7 @@ def main():
                 arc_n=args.arc_n,
                 work_dir=arc_work_dir,
                 dataset_hub=args.dataset_hub,
+                no_thinking=args.no_thinking,
             )
             all_results[mode] = result
 
@@ -452,7 +588,20 @@ def main():
         finally:
             if proc:
                 _kill_server(proc, mode)
-            time.sleep(5)  # Let GPU memory release
+            # Wait for the CUDA driver to reclaim the vLLM server's GPU memory
+            # before starting the next mode. Fixed sleep is unreliable for
+            # large allocations (~40 GiB); poll until free >= vLLM threshold.
+            try:
+                gpu_mem_util = args.gpu_memory_utilization
+                total_mib = int(subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=memory.total",
+                     "--format=csv,noheader,nounits", f"--id={args.gpu}"],
+                    stderr=subprocess.DEVNULL,
+                ).decode().strip().splitlines()[0])
+                need_mib = int(total_mib * gpu_mem_util) + 512
+                _wait_gpu_free(args.gpu, need_mib)
+            except Exception:
+                time.sleep(30)
 
     # Stage 4: Report
     print(f"\n{'='*60}")

@@ -140,7 +140,7 @@ def export_bf16_for_vllm(
                        and module.activation_fake_quantizer.static_scale is not None)
         layer_info = {
             "quantization_method": "hifp8",
-            "has_smooth_scale": module.smooth_scale is not None,
+            "has_smooth_scale": getattr(module, "smooth_scale", None) is not None,
             "has_weight_static_scale": has_w_scale,
             "has_activation_static_scale": has_a_scale,
             "granularity": {},

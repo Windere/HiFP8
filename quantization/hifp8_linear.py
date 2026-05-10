@@ -63,8 +63,11 @@ class HiFP8FakeQuantizedLinear(nn.Linear):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 1. Apply SmoothQuant scaling
-        if self.smooth_scale is not None:
-            x = x / self.smooth_scale
+        # Use getattr: fuse code deletes the buffer before re-setting as plain None,
+        # so direct attribute access raises AttributeError during that window.
+        _smooth = getattr(self, "smooth_scale", None)
+        if _smooth is not None:
+            x = x / _smooth
 
         # 2. Fake-quantize activation
         if self.activation_fake_quantizer is not None:

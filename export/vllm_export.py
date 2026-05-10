@@ -94,7 +94,11 @@ def export_for_vllm(
     Full export pipeline: convert fake-quantized model and save for vLLM.
 
     1. Convert HiFP8FakeQuantizedLinear → nn.Linear with Float8Tensor weights
-    2. Save model and tokenizer using HuggingFace save_pretrained()
+    2. Materialise Float8Tensor weights back to bf16 for serialization —
+       Float8Tensor has no accessible storage pointer and crashes both
+       safetensors and transformers.save_pretrained. The quantization noise
+       is already embedded in the weights from the fake-quant forward pass.
+    3. Save model and tokenizer using HuggingFace save_pretrained()
 
     Args:
         model: Model with HiFP8FakeQuantizedLinear layers.
@@ -107,6 +111,20 @@ def export_for_vllm(
         The output directory path.
     """
     model = convert_to_float8_for_vllm(model, mode=mode)
+
+    # Float8Tensor weights cannot be serialized by safetensors or
+    # transformers.save_pretrained (no accessible storage pointer).
+    # Dequantise back to bf16; quantisation noise was already applied
+    # by the fake-quant forward pass before this export step.
+    for module in model.modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        w = module.weight.data
+        if isinstance(w, Float8Tensor):
+            module.weight = nn.Parameter(
+                w.to(torch.bfloat16), requires_grad=False
+            )
+
     model.save_pretrained(output_dir, safe_serialization=safe_serialization)
     tokenizer.save_pretrained(output_dir)
     return output_dir

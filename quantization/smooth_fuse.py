@@ -111,6 +111,10 @@ def rollback_unfoldable_smooths(model: nn.Module) -> Dict[str, str]:
     amax for outlier-heavy rows, killing LUT precision. So the default
     pipeline rolls back these layers' apply_smooth_scale modification,
     leaving them as plain HiFP8-quantized (no smoothing for those two).
+
+    Also performs a catch-all rollback of any remaining layers with smooth_scale
+    that weren't handled by fuse_smooth_into_norms (e.g. lm_head). These layers
+    cannot be folded into a preceding norm, so the only safe option is rollback.
     """
     log: Dict[str, str] = {}
     blocks, _ = _find_blocks(model)
@@ -120,17 +124,34 @@ def rollback_unfoldable_smooths(model: nn.Module) -> Dict[str, str]:
             lin = _get_submodule(block, path)
             if not isinstance(lin, HiFP8FakeQuantizedLinear):
                 continue
-            if lin.smooth_scale is None:
+            if getattr(lin, "smooth_scale", None) is None:
                 continue
             s = lin.smooth_scale.to(device=lin.weight.device,
                                      dtype=lin.weight.dtype)
             with torch.no_grad():
                 lin.weight.data = lin.weight.data / s.unsqueeze(0)
-            lin.smooth_scale = None
             if "smooth_scale" in lin._buffers:
                 del lin._buffers["smooth_scale"]
+            lin.smooth_scale = None
             log[f"L{block_idx}.{path}"] = "rolled back"
             n += 1
+
+    # Catch-all: roll back any remaining top-level layers that still have smooth_scale
+    # (e.g. lm_head). These are not inside a decoder block so the loop above misses them.
+    for name, module in model.named_modules():
+        if not isinstance(module, HiFP8FakeQuantizedLinear):
+            continue
+        if getattr(module, "smooth_scale", None) is None:
+            continue
+        s = module.smooth_scale.to(device=module.weight.device, dtype=module.weight.dtype)
+        with torch.no_grad():
+            module.weight.data = module.weight.data / s.unsqueeze(0)
+        if "smooth_scale" in module._buffers:
+            del module._buffers["smooth_scale"]
+        module.smooth_scale = None
+        log[name] = "rolled back (catch-all)"
+        n += 1
+
     log["_summary"] = f"rolled back {n} unfoldable Linears"
     return log
 
@@ -197,9 +218,9 @@ def fuse_smooth_into_norms(
                     lin.weight.data = lin.weight.data * ratio.unsqueeze(0).to(
                         device=lin.weight.device, dtype=lin.weight.dtype,
                     )
-                lin.smooth_scale = None
                 if "smooth_scale" in lin._buffers:
                     del lin._buffers["smooth_scale"]
+                lin.smooth_scale = None
 
             log[f"L{block_idx}.{norm_name}"] = (
                 f"folded into {len(siblings)} siblings (unified by max)"
@@ -229,9 +250,9 @@ def _fuse_ffn_glu(block: nn.Module, target_path: str, source_path: str,
 
     # source.weight (down_proj) was already multiplied by s by apply_smooth_scale.
     # Leave it as-is — that's exactly what we want: W_d_new = W_d · s.
-    source.smooth_scale = None
     if "smooth_scale" in source._buffers:
         del source._buffers["smooth_scale"]
+    source.smooth_scale = None
     return f"folded into {target_path} (s.shape={tuple(s.shape)})"
 
 
@@ -280,9 +301,9 @@ def _fuse_attn_gqa(block: nn.Module, target_path: str, source_path: str,
     with torch.no_grad():
         source.weight.data = source.weight.data * ratio.unsqueeze(0)
 
-    source.smooth_scale = None
     if "smooth_scale" in source._buffers:
         del source._buffers["smooth_scale"]
+    source.smooth_scale = None
     return (f"folded into {target_path} (GQA: H_attn={n_attn_heads}, "
             f"H_kv={n_kv_heads}, max-unify across {heads_per_kv} attn-heads/kv)")
 
