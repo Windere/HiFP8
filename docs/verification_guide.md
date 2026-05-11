@@ -309,10 +309,17 @@ python scripts/demo_nothink_compare.py \
 
 加 `--force-reexport` 强制重新量化（改 alpha / scale_factor 后用）。
 
-### Demo C：完整 ARC 评测（~25 min）
+### Demo C：完整 ARC 评测
 
-用 `evalscope` 跑 ARC-Easy + ARC-Challenge 各 100 题，输出量化前后的精度对比表。
-这是 README 的标准 benchmark：
+`--arc-n N` 控制每个 ARC 子集的题数：
+
+| `--arc-n` 值 | 总题数 | 用途 | 预估耗时（baseline+hif8，non-think） |
+|---|---|---|---|
+| **100**（default） | 200（ARC-E 100 + ARC-C 100） | 快速验证 | ~25 min |
+| 200 | 400 | 降低统计噪声（SE 减半） | ~50 min |
+| **0**（特殊值） | 3548（ARC-E 全 2376 + ARC-C 全 1172） | **全量评测**，用于发表 / 强保证 | ~3-5 hours |
+
+100 题已经能区分 >3 pp 的差异（SE≈5 pp），200 题能区分 >2 pp。默认值跑：
 
 ```bash
 PYTHONUNBUFFERED=1 PYTHONPATH=$(pwd):$(pwd)/ao \
@@ -343,6 +350,21 @@ cat outputs/arc_demo/arc_results/hif8/reports/hif8/arc.json
 |------|----------|---------------|------|-------------|
 | baseline | ~0.64 | ~0.48 | ~0.56 | — |
 | hif8 (sf=16, α=0.7) | ~0.62 | ~0.51 | ~0.565 | ~0 pp（统计噪声内） |
+
+**全量评测**（更高保真，但远慢）：
+
+```bash
+python scripts/test_full_pipeline.py \
+    --model Qwen/Qwen3-0.6B \
+    --output-dir outputs/arc_full \
+    --modes baseline,hif8 \
+    --smooth-quant --no-thinking \
+    --arc-n 0 \
+    --gpu 0 --gpu-memory-utilization 0.5
+```
+
+`--arc-n 0` 触发：内部省略 evalscope 的 `--limit` → 跑 ARC-Easy 全 2376 + ARC-Challenge 全 1172。
+benchmark 单次超时也从默认 7200s 自动放大到 14400s。建议挂 `nohup` 或 tmux。
 
 ### 评估已导出的 hif8 模型 vs BF16 baseline（eval-only，~10 min）
 

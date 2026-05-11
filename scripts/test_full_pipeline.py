@@ -31,7 +31,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", default="./outputs/pipeline_test",
                    help="Root dir for exports and results")
     p.add_argument("--arc-n", type=int, default=100,
-                   help="Number of ARC-Easy questions per benchmark run")
+                   help="Cap on questions PER ARC subset (default: 100 per "
+                        "subset, so 200 total: ARC-Easy + ARC-Challenge). "
+                        "Pass 0 for full ARC eval (2376 + 1172 = 3548 total) "
+                        "— this can take 1-2 hours per vLLM server.")
     p.add_argument("--modes", default="baseline,bf16,uint8,hif8",
                    type=lambda s: s.split(","),
                    help="Comma-separated modes to run")
@@ -59,7 +62,7 @@ def parse_args() -> argparse.Namespace:
                    help="SmoothQuant alpha in [0,1]. s = x_amax^alpha / w_amax^(1-alpha). "
                         "Default 0.7 (empirically best on Qwen3-0.6B with sf=16 — see "
                         "outputs/sweep_2d_*.json). Alpha is a weak lever (alpha 0.5-0.8 "
-                        "all within ~5% of each other); scale_factor matters far more. "
+                        "all within ~5%% of each other); scale_factor matters far more. "
                         "Only used when --smooth-quant is set.")
     p.add_argument("--no-thinking", action="store_true",
                    help="Pass enable_thinking=false to evalscope generation config "
@@ -377,8 +380,11 @@ def _run_arc_benchmark(model_name: str, port: int, arc_n: int,
         "--work-dir", work_dir,
         "--no-timestamp",
         "--seed", "42",
-        "--limit", str(arc_n),
     ]
+    if arc_n > 0:
+        # Cap each ARC subset (ARC-Easy / ARC-Challenge) to arc_n questions.
+        # arc_n=0 → omit --limit → full ARC (2376 + 1172).
+        cmd += ["--limit", str(arc_n)]
     if no_thinking:
         # Qwen3 thinking is gated by chat_template_kwargs.enable_thinking. The
         # evalscope GenerateConfig schema doesn't translate top-level unknown
@@ -398,12 +404,15 @@ def _run_arc_benchmark(model_name: str, port: int, arc_n: int,
     env["HF_HOME"] = str(_cache_root / "huggingface")
     env["MODELSCOPE_CACHE"] = str(_cache_root / "modelscope")
 
-    print(f"[Benchmark] Running ARC for {model_name} (limit={arc_n})")
+    limit_desc = "FULL (no --limit)" if arc_n <= 0 else f"limit={arc_n}/subset"
+    print(f"[Benchmark] Running ARC for {model_name} ({limit_desc})")
+    # Full ARC (3548 q) can take 1-2h per server; bump timeout accordingly.
+    bench_timeout = 14400 if arc_n <= 0 else 7200
     try:
         r = subprocess.run(cmd, env=env, capture_output=True,
-                           text=True, timeout=7200)
+                           text=True, timeout=bench_timeout)
     except subprocess.TimeoutExpired:
-        return {"error": "benchmark timed out after 7200s"}
+        return {"error": f"benchmark timed out after {bench_timeout}s"}
 
     if r.returncode != 0:
         print(f"[Benchmark] STDERR: {r.stderr[-1000:]}")
