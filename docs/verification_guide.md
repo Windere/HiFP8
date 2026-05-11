@@ -2,13 +2,23 @@
 
 ## 环境准备
 
-每次进入工作目录前执行：
+每次进入工作目录前执行（与 conda / 仓库具体路径无关）：
 
 ```bash
-conda activate hifp8-eval
-export LD_LIBRARY_PATH="/home/kailong/miniconda3/envs/hifp8-eval/lib/python3.12/site-packages/torch/lib:$LD_LIBRARY_PATH"
-cd /home/kailong/HiFP8
-source setup_env.sh
+cd <YOUR_HIFP8_CLONE_DIR>        # e.g. ~/HiFP8 or /workspace/HiFP8
+conda activate hifp8-eval        # 或 setup 时指定的 HIFP8_ENV_NAME
+# 让 hifp8_cuda_uint8.so 能找到 libc10.so 等 torch 共享库：
+export LD_LIBRARY_PATH="$(python -c 'import torch,os; print(os.path.join(os.path.dirname(torch.__file__),"lib"))'):${LD_LIBRARY_PATH:-}"
+```
+
+如果是首次部署到新机器：
+
+```bash
+git clone git@github.com:Windere/HiFP8.git && cd HiFP8
+# CONDA_ROOT 默认自动检测（依次试 $CONDA_ROOT / conda info --base / ~/miniconda3
+# / /opt/conda 等）；如需显式指定：
+#   CONDA_ROOT=/opt/anaconda3 HIFP8_ENV_NAME=myenv bash setup_env_hifp8_eval.sh
+bash setup_env_hifp8_eval.sh     # ~15-25 min；幂等可反复跑
 ```
 
 ---
@@ -333,6 +343,45 @@ cat outputs/arc_demo/arc_results/hif8/reports/hif8/arc.json
 |------|----------|---------------|------|-------------|
 | baseline | ~0.64 | ~0.48 | ~0.56 | — |
 | hif8 (sf=16, α=0.7) | ~0.62 | ~0.51 | ~0.565 | ~0 pp（统计噪声内） |
+
+### 评估已导出的 hif8 模型 vs BF16 baseline（eval-only，~10 min）
+
+如果**已经有 hif8 export**（自己跑过 demo / pipeline 留下的，或同事拷过来的），
+不需要重新量化，直接做 ARC 对比：
+
+```bash
+# 把现成的 hif8 checkpoint 放到 outputs/eval_only/hif8/，
+# 同目录下放对应的 baseline reference（HF id 或本地路径）。
+mkdir -p outputs/eval_only
+cp -r /path/to/existing_hif8_checkpoint outputs/eval_only/hif8
+
+PYTHONUNBUFFERED=1 PYTHONPATH=$(pwd):$(pwd)/ao \
+python scripts/test_full_pipeline.py \
+    --model Qwen/Qwen3-0.6B \
+    --output-dir outputs/eval_only \
+    --modes baseline,hif8 \
+    --skip-export --no-thinking \
+    --gpu 0 --gpu-memory-utilization 0.5 --port 8090
+```
+
+`--skip-export` 触发 eval-only 模式：
+
+- ✅ **跳过** load 全精度模型 + quantize + SmoothQuant + export（省 ~3 min）
+- ✅ 起 baseline vLLM（参数走 `--model`）
+- ✅ 起 hif8 vLLM（从 `outputs/eval_only/hif8/` 加载）
+- ✅ 两边都跑 ARC + 写对比表
+
+> 注意：`--model` 仍然要传——它告诉脚本 baseline 服务用哪个 checkpoint。
+> 如果只想测 hif8 不要 baseline，传 `--modes hif8`。
+
+如果想要交互式 side-by-side 答案对比（不跑 ARC），同样的 export 也能复用 demo 脚本：
+
+```bash
+# demo_nothink_compare.py 检测 outputs/<out-dir>/hif8/model.safetensors 存在就跳过 quantize
+python scripts/demo_nothink_compare.py \
+    --model Qwen/Qwen3-0.6B \
+    --out-dir outputs/eval_only       # 复用现成 hif8 export
+```
 
 ### 切换到其他模型
 

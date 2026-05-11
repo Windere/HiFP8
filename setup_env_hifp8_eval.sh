@@ -9,7 +9,7 @@
 #
 # Environment variables (override defaults):
 #   HIFP8_ENV_NAME   — conda env name (default: hifp8-eval)
-#   CONDA_ROOT       — conda base dir  (default: /home/kailong/miniconda3)
+#   CONDA_ROOT       — conda base dir  (auto-detected if not set)
 #   HIFP8_TORCH_VER  — torch version   (default: 2.9.0)
 #   HIFP8_TORCH_INDEX— torch wheel idx (default: cu128)
 set -euo pipefail
@@ -20,12 +20,29 @@ LOG_DIR="${WORKSPACE}/outputs/logs"
 VENDOR_DIR="${WORKSPACE}/outputs/vendor"
 VLLM_FORK_DIR="${VENDOR_DIR}/vllm-hifp8-fork"
 
-CONDA_ROOT="${CONDA_ROOT:-/home/kailong/miniconda3}"
-if [ ! -f "${CONDA_ROOT}/etc/profile.d/conda.sh" ]; then
-    echo "[setup] ERROR: conda not found at ${CONDA_ROOT}." \
-         " Set CONDA_ROOT=/path/to/miniconda3 and re-run." >&2
+# Auto-detect conda root. Priority: $CONDA_ROOT env → `conda info --base` →
+# common locations. Set CONDA_ROOT explicitly to override.
+if [ -z "${CONDA_ROOT:-}" ]; then
+    if command -v conda >/dev/null 2>&1; then
+        CONDA_ROOT="$(conda info --base 2>/dev/null || true)"
+    fi
+    if [ -z "${CONDA_ROOT:-}" ]; then
+        for _cand in "${HOME}/miniconda3" "${HOME}/anaconda3" \
+                     "/opt/miniconda3" "/opt/anaconda3" \
+                     "/opt/conda" "/usr/local/miniconda3"; do
+            if [ -f "${_cand}/etc/profile.d/conda.sh" ]; then
+                CONDA_ROOT="${_cand}"
+                break
+            fi
+        done
+    fi
+fi
+if [ -z "${CONDA_ROOT:-}" ] || [ ! -f "${CONDA_ROOT}/etc/profile.d/conda.sh" ]; then
+    echo "[setup] ERROR: conda not found. Searched \$CONDA_ROOT, 'conda info --base'," \
+         "and common locations. Set CONDA_ROOT=/path/to/miniconda3 explicitly." >&2
     exit 1
 fi
+echo "[setup] Using CONDA_ROOT=${CONDA_ROOT}"
 mkdir -p "${LOG_DIR}" "${VENDOR_DIR}"
 
 source "${CONDA_ROOT}/etc/profile.d/conda.sh"

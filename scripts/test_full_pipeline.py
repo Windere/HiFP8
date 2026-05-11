@@ -517,12 +517,23 @@ def main():
     print(f"[Pipeline] modes={args.modes}  arc-n={args.arc_n}")
     print(f"[Pipeline] output={output_dir}")
 
-    # Stage 1: Quantize (skip if only running baseline)
+    # Stage 1: Quantize. Skipped when:
+    #   (a) only running baseline (no quantized modes), OR
+    #   (b) --skip-export AND every non-baseline export dir already exists
+    #       (pure eval-only run against a pre-built checkpoint)
     model, tokenizer = None, None
-    if any(m != "baseline" for m in args.modes):
-        model, tokenizer = _quantize_model(args.model, scale_factor=args.scale_factor,
-                                            smooth_quant=args.smooth_quant,
-                                            smooth_alpha=args.smooth_alpha)
+    non_baseline = [m for m in args.modes if m != "baseline"]
+    if non_baseline:
+        all_exports_cached = args.skip_export and all(
+            _export_dir(str(output_dir), m).exists() for m in non_baseline
+        )
+        if all_exports_cached:
+            print(f"[Pipeline] All non-baseline exports exist in {output_dir}; "
+                  f"skipping quantize+export stage (eval-only mode).")
+        else:
+            model, tokenizer = _quantize_model(args.model, scale_factor=args.scale_factor,
+                                                smooth_quant=args.smooth_quant,
+                                                smooth_alpha=args.smooth_alpha)
 
     # Stage 2: Export
     exports = _export_all(
