@@ -566,6 +566,35 @@ def main():
         torch.cuda.empty_cache()
         time.sleep(5)
 
+    # Pre-flight: if hif8 mode is requested, verify the installed vLLM
+    # registers the 'hif8' quant_method. Otherwise the server start will
+    # waste --vllm-startup-timeout seconds before failing with a pydantic
+    # ValidationError ("Unknown quantization method: hif8"). The cause is
+    # almost always stock vLLM being installed instead of XiangWanggithub's
+    # vllm-hifp8 fork.
+    if "hif8" in args.modes:
+        try:
+            from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
+            if "hif8" not in QUANTIZATION_METHODS:
+                import vllm as _vllm_pkg
+                print(f"\n[Pipeline] FATAL: 'hif8' is not a registered vLLM "
+                      f"quantization method.")
+                print(f"[Pipeline]   Currently active vLLM: {_vllm_pkg.__file__}")
+                print(f"[Pipeline]   Version: {_vllm_pkg.__version__}")
+                print(f"[Pipeline]   Registered methods: "
+                      f"{sorted(QUANTIZATION_METHODS.keys())}")
+                print(f"[Pipeline]")
+                print(f"[Pipeline] Fix: install the XiangWanggithub/vllm fork:")
+                print(f"[Pipeline]   pip uninstall -y vllm && \\")
+                print(f"[Pipeline]   bash setup_env_hifp8_eval.sh   # idempotent")
+                print(f"[Pipeline] Or, if outputs/vendor/vllm-hifp8-fork/ already "
+                      f"exists:")
+                print(f"[Pipeline]   pip install -e outputs/vendor/vllm-hifp8-fork")
+                sys.exit(2)
+        except ImportError as e:
+            print(f"\n[Pipeline] FATAL: cannot import vllm: {e}")
+            sys.exit(2)
+
     # Stage 3 + 4 (interleaved per mode): serve -> benchmark -> kill
     all_results = {}
     for mode in args.modes:

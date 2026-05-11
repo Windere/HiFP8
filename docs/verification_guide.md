@@ -427,5 +427,43 @@ python scripts/test_full_pipeline.py --model Qwen/Qwen3-7B-Instruct \
 | `OSError: libc10.so` 加载失败 | torch shared lib 不在 LD_LIBRARY_PATH | 用 setup_env_hifp8_eval.sh 或手工 export |
 | vLLM 启动 600s 超时 | 第一次下载/编译 / GPU 内存争抢 | 看 `outputs/.../logs/vllm_*.log`；降低 `--gpu-memory-utilization` |
 | hif8 server `Dynamo cannot trace` | torch.compile 试图 trace 自定义 CUDA kernel | 已默认 `--enforce-eager`；如自定义命令注意加上 |
+| hif8 server 起不来，报 `Unknown quantization method: hif8` | 装的是 stock vLLM，没有 `hif8` 注册 | 见下方"vLLM 必须是 fork" |
 | baseline 答案带 `<think>` 标签 | `enable_thinking=false` 未到 vLLM | 确认请求体里有 `chat_template_kwargs={"enable_thinking": false}` |
 | 远程下载慢 | HF 国内不通 | 设置 `HF_ENDPOINT=https://hf-mirror.com` 或预先 `huggingface-cli download` |
+
+### vLLM 必须是 XiangWanggithub fork
+
+hif8 模式依赖 vLLM 注册 `hif8` 和 `hif8_fake` 为 `quant_method`，**这是 XiangWanggithub fork 独有的**。
+stock vLLM（或其他 quant-fork）不会有，加载 hif8 checkpoint 时会报：
+
+```
+ValueError: Unknown quantization method: hif8.
+Must be one of ['awq', 'fp8', 'ptpc_fp8', ...]
+```
+
+诊断（看当前 vLLM 是谁、是否注册了 hif8）：
+
+```bash
+python -c "
+import vllm
+print('vllm file   :', vllm.__file__)
+print('vllm version:', vllm.__version__)
+from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
+ok = 'hif8' in QUANTIZATION_METHODS and 'hif8_fake' in QUANTIZATION_METHODS
+print('hif8/hif8_fake registered:', ok)
+print('all registered           :', sorted(QUANTIZATION_METHODS.keys()))
+"
+```
+
+修复（卸载错误 vLLM，重装 fork）：
+
+```bash
+pip uninstall -y vllm
+cd <YOUR_HIFP8_CLONE_DIR>
+bash setup_env_hifp8_eval.sh        # 幂等：会克隆 fork 并 pip install -e
+
+# 或者，如果 fork 已经 clone 在 outputs/vendor/vllm-hifp8-fork/：
+pip install -e outputs/vendor/vllm-hifp8-fork
+```
+
+> **pipeline 现在会在启动 hif8 server 前做这个检查** —— 没注册的话直接 fail-fast，不会浪费 baseline eval 半小时后才崩。

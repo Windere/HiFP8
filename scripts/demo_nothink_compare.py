@@ -238,6 +238,24 @@ def main():
                     help="Re-build the hif8 export even if one is cached.")
     args = ap.parse_args()
 
+    # Pre-flight: verify the installed vLLM registers 'hif8'. Otherwise
+    # the hif8 server start later will waste minutes before failing with
+    # "Unknown quantization method: hif8". Cause: stock vLLM installed
+    # instead of XiangWanggithub/vllm-hifp8 fork.
+    try:
+        from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
+        if "hif8" not in QUANTIZATION_METHODS:
+            import vllm as _vllm_pkg
+            print(f"\n[demo] FATAL: 'hif8' is not a registered vLLM quantization method.")
+            print(f"[demo]   Active vLLM: {_vllm_pkg.__file__} ({_vllm_pkg.__version__})")
+            print(f"[demo]   Registered: {sorted(QUANTIZATION_METHODS.keys())}")
+            print(f"[demo] Fix: pip uninstall -y vllm && bash setup_env_hifp8_eval.sh")
+            print(f"[demo]   (or pip install -e outputs/vendor/vllm-hifp8-fork)")
+            sys.exit(2)
+    except ImportError as e:
+        print(f"\n[demo] FATAL: cannot import vllm: {e}")
+        sys.exit(2)
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     hif8_dir = out_dir / "hif8"
