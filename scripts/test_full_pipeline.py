@@ -347,9 +347,24 @@ def _kill_server(proc: subprocess.Popen, name: str):
                 pass
 
 
-def _wait_gpu_free(gpu_id: str, need_mib: int, timeout: int = 120) -> None:
-    """Poll nvidia-smi until physical GPU `gpu_id` has at least `need_mib` MiB free."""
+def _wait_gpu_free(gpu_id: str, need_mib: int, timeout: int = 180,
+                   stable_polls: int = 3, stable_tol_mib: int = 256,
+                   poll_interval: float = 3.0) -> None:
+    """Poll nvidia-smi until GPU `gpu_id` has at least `need_mib` MiB free
+    AND the free amount has been stable (within stable_tol_mib) for
+    stable_polls consecutive readings.
+
+    Why "stable" matters: when a vLLM process is killed, the CUDA driver
+    releases its memory asynchronously over 5-15 seconds for ~40 GiB
+    allocations. A naive threshold check (free >= need_mib) can return
+    while release is still in progress; then the next vLLM starts,
+    snapshots a low free amount, and when the previous process's release
+    completes mid-init, vLLM's `init_free > current_free` assertion
+    fires ("Initial X GiB, current Y GiB" with Y > X). Requiring stability
+    ensures the driver finished reclaiming before we hand the GPU off.
+    """
     deadline = time.time() + timeout
+    recent = []  # last stable_polls readings of free_mib
     while time.time() < deadline:
         try:
             out = subprocess.check_output(
@@ -358,12 +373,17 @@ def _wait_gpu_free(gpu_id: str, need_mib: int, timeout: int = 120) -> None:
                 stderr=subprocess.DEVNULL,
             ).decode().strip()
             free_mib = int(out.splitlines()[0])
-            if free_mib >= need_mib:
+            recent.append(free_mib)
+            if len(recent) > stable_polls:
+                recent.pop(0)
+            if (len(recent) >= stable_polls and min(recent) >= need_mib
+                    and (max(recent) - min(recent)) <= stable_tol_mib):
                 return
         except Exception:
             pass
-        time.sleep(5)
-    print(f"[Server] Warning: GPU {gpu_id} still below {need_mib} MiB free after {timeout}s")
+        time.sleep(poll_interval)
+    print(f"[Server] Warning: GPU {gpu_id} did not stabilise at ≥{need_mib} MiB "
+          f"free within {timeout}s (last readings: {recent})")
 
 
 def _run_arc_benchmark(model_name: str, port: int, arc_n: int,

@@ -162,9 +162,16 @@ def stop_vllm(p: subprocess.Popen, label: str = ""):
     print(f"[demo] {label} stopped")
 
 
-def wait_gpu_free(gpu: str, need_mib: int = 1024, timeout: int = 120):
-    """Poll nvidia-smi until GPU has at least need_mib free."""
+def wait_gpu_free(gpu: str, need_mib: int = 1024, timeout: int = 180,
+                   stable_polls: int = 3, stable_tol_mib: int = 256,
+                   poll_interval: float = 3.0):
+    """Poll nvidia-smi until GPU `gpu` has at least need_mib free AND
+    the free amount has been stable for stable_polls consecutive polls.
+    See test_full_pipeline._wait_gpu_free for the rationale (CUDA driver
+    releases memory async after vLLM kill; naive threshold check can
+    return mid-release and trigger the next vLLM's monotonicity assert)."""
     deadline = time.time() + timeout
+    recent = []
     while time.time() < deadline:
         try:
             out = subprocess.check_output(
@@ -172,12 +179,18 @@ def wait_gpu_free(gpu: str, need_mib: int = 1024, timeout: int = 120):
                  "--format=csv,noheader,nounits", f"--id={gpu}"],
                 stderr=subprocess.DEVNULL,
             ).decode().strip()
-            if int(out.splitlines()[0]) >= need_mib:
+            free_mib = int(out.splitlines()[0])
+            recent.append(free_mib)
+            if len(recent) > stable_polls:
+                recent.pop(0)
+            if (len(recent) >= stable_polls and min(recent) >= need_mib
+                    and (max(recent) - min(recent)) <= stable_tol_mib):
                 return
         except Exception:
             pass
-        time.sleep(3)
-    print(f"[demo] Warning: GPU {gpu} still below {need_mib} MiB free after {timeout}s")
+        time.sleep(poll_interval)
+    print(f"[demo] Warning: GPU {gpu} did not stabilise at ≥{need_mib} MiB free "
+          f"within {timeout}s (last readings: {recent})")
 
 
 def _vllm_memory_floor_mib(gpu: str, gpu_mem_util: float) -> int:
