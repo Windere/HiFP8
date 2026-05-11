@@ -555,16 +555,43 @@ def main():
         hif8_scale_factor=args.scale_factor,
     )
 
-    # Free GPU memory before serving — synchronize and wait for the CUDA driver
-    # to fully release cached memory. Without this, vLLM's memory profiling
-    # assertion fails because the driver reports increasing free memory (released
-    # by this process) during vLLM's 14-second torch.compile initialization.
+    # Free GPU memory before serving — vLLM v1 takes a memory snapshot at init
+    # start and asserts that free memory only DECREASES during init (its own
+    # profiling). If the pipeline's quantize/export tensors release AFTER vLLM
+    # snapshots, free memory increases mid-init and triggers:
+    #   "AssertionError: Error in memory profiling. Initial free memory X GiB,
+    #    current free memory Y GiB" (with Y > X).
+    # Fix: drop refs, synchronize CUDA streams, force a GC pass, empty the
+    # caching allocator, then POLL nvidia-smi until free memory stabilises
+    # (rather than a fixed sleep that's not enough on slow boxes).
     if model is not None:
-        import torch, time
+        import torch, gc
         del model
+        try:
+            del tokenizer  # also holds GPU tensors (embedding etc.)
+        except NameError:
+            pass
+        gc.collect()
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-        time.sleep(5)
+        # Need at least gpu_memory_utilization × total GiB free, with a 512 MiB
+        # safety margin. Poll up to 120s — quantize+export typically frees
+        # 1-15 GiB depending on model size; allow time for slow drivers.
+        try:
+            total_mib = int(subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=memory.total",
+                 "--format=csv,noheader,nounits", f"--id={args.gpu}"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip().splitlines()[0])
+            need_mib = int(total_mib * args.gpu_memory_utilization) + 512
+            print(f"[Pipeline] Waiting for GPU {args.gpu} to free "
+                  f"{need_mib} MiB before starting first vLLM server...")
+            _wait_gpu_free(args.gpu, need_mib, timeout=120)
+        except Exception as e:
+            # Fallback: longer sleep than the old 5s if nvidia-smi probing fails
+            print(f"[Pipeline] nvidia-smi probe failed ({e}); falling back to 30s sleep.")
+            import time
+            time.sleep(30)
 
     # Pre-flight: if hif8 mode is requested, verify the installed vLLM
     # registers the 'hif8' quant_method. Otherwise the server start will

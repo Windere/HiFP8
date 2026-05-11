@@ -177,6 +177,21 @@ def wait_gpu_free(gpu: str, need_mib: int = 1024, timeout: int = 120):
         except Exception:
             pass
         time.sleep(3)
+    print(f"[demo] Warning: GPU {gpu} still below {need_mib} MiB free after {timeout}s")
+
+
+def _vllm_memory_floor_mib(gpu: str, gpu_mem_util: float) -> int:
+    """How much free memory vLLM needs before init (approx).
+    Returns gpu_mem_util x total + 512 MiB safety margin, or a fallback."""
+    try:
+        total_mib = int(subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.total",
+             "--format=csv,noheader,nounits", f"--id={gpu}"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip().splitlines()[0])
+        return int(total_mib * gpu_mem_util) + 512
+    except Exception:
+        return 8192  # fall back to "at least 8 GiB free"
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +285,13 @@ def main():
             shutil.rmtree(hif8_dir)
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
         quantize_and_export(args.model, out_dir)
-        wait_gpu_free(args.gpu, need_mib=2048)
+        # Wait until enough memory is actually free for vLLM init —
+        # quantize_and_export holds 1-15 GiB of model state, and vLLM's
+        # memory profiler asserts free_memory must decrease monotonically
+        # during init. Polling avoids the "Initial X GiB, current Y GiB"
+        # assertion when releasing memory mid-init.
+        wait_gpu_free(args.gpu, need_mib=_vllm_memory_floor_mib(
+            args.gpu, args.gpu_memory_utilization))
 
     # ---- Step 2: baseline ----
     print("\n[demo] === Baseline (BF16) ===")
@@ -291,7 +312,8 @@ def main():
         )
     finally:
         stop_vllm(bp, "baseline")
-    wait_gpu_free(args.gpu, need_mib=int(args.gpu_memory_utilization * 40000))
+    wait_gpu_free(args.gpu, need_mib=_vllm_memory_floor_mib(
+        args.gpu, args.gpu_memory_utilization))
 
     # ---- Step 3: hif8 ----
     print("\n[demo] === HiFP8 w8a8 (sf=16, α=0.7) ===")
