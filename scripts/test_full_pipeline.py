@@ -422,26 +422,26 @@ def _run_arc_benchmark(model_name: str, port: int, arc_n: int,
 
 
 def _parse_arc_results(work_dir: str) -> dict:
-    """Scan work_dir JSON files; return {"accuracy": float} on first match.
+    """Scan work_dir JSON files; return per-subset + mean accuracy.
 
-    evalscope writes arc.json with top-level "score" and a "metrics" array.
-    We normalize any found accuracy-like value to the "accuracy" key so the
-    rest of the pipeline only needs to handle one canonical name.
+    evalscope writes arc.json with:
+      - top-level "score" = mean across ARC-Easy + ARC-Challenge
+      - metrics[0].categories[0].subsets = per-subset scores
+
+    Returns {"accuracy": mean, "arc_easy": float, "arc_challenge": float}
+    (subset keys may be missing if evalscope changed schema).
     """
     _SCORE_KEYS = ("accuracy", "acc", "score", "mean_acc")
 
-    def _extract(data: dict) -> float | None:
-        # Direct top-level key
+    def _extract_mean(data: dict) -> float | None:
         for k in _SCORE_KEYS:
             if k in data and isinstance(data[k], (int, float)):
                 return float(data[k])
-        # Nested under "results"
         if isinstance(data.get("results"), dict):
             for k in _SCORE_KEYS:
                 v = data["results"].get(k)
                 if isinstance(v, (int, float)):
                     return float(v)
-        # evalscope "metrics" array: [{name: ..., score: ...}]
         for entry in data.get("metrics", []):
             if isinstance(entry, dict) and entry.get("name") in _SCORE_KEYS:
                 v = entry.get("score")
@@ -449,15 +449,32 @@ def _parse_arc_results(work_dir: str) -> dict:
                     return float(v)
         return None
 
+    def _extract_subsets(data: dict) -> dict:
+        """Walk metrics → categories → subsets and return {name: score} dict."""
+        out = {}
+        for m in data.get("metrics", []) or []:
+            for cat in (m.get("categories") or []) if isinstance(m, dict) else []:
+                for sub in (cat.get("subsets") or []) if isinstance(cat, dict) else []:
+                    if isinstance(sub, dict) and "name" in sub and "score" in sub:
+                        out[sub["name"]] = float(sub["score"])
+        return out
+
     for json_file in sorted(Path(work_dir).rglob("*.json")):
         try:
             with open(json_file) as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 continue
-            val = _extract(data)
-            if val is not None:
-                return {"accuracy": val}
+            mean = _extract_mean(data)
+            if mean is None:
+                continue
+            result = {"accuracy": mean}
+            subsets = _extract_subsets(data)
+            if "ARC-Easy" in subsets:
+                result["arc_easy"] = subsets["ARC-Easy"]
+            if "ARC-Challenge" in subsets:
+                result["arc_challenge"] = subsets["ARC-Challenge"]
+            return result
         except Exception as e:
             print(f"[Parse] Warning: could not parse {json_file}: {e}")
     return {}
@@ -469,13 +486,19 @@ def _format_table(results: dict) -> str:
     if isinstance(baseline, dict) and "accuracy" in baseline:
         baseline_acc = baseline["accuracy"]
 
-    header = f"{'Mode':<16} {'ARC-E acc':>10} {'vs baseline':>12}"
+    # Columns: mode | ARC-Easy | ARC-Challenge | ARC mean | vs baseline (mean)
+    header = (f"{'Mode':<16} {'ARC-Easy':>9} {'ARC-Chal':>9} "
+              f"{'ARC mean':>10} {'vs baseline':>13}")
     sep = "-" * len(header)
     lines = [sep, header, sep]
 
     for mode, data in results.items():
         if isinstance(data, dict) and "accuracy" in data and isinstance(data["accuracy"], (int, float)):
             acc = data["accuracy"]
+            ae = data.get("arc_easy")
+            ac = data.get("arc_challenge")
+            ae_str = f"{ae * 100:.1f} %" if isinstance(ae, (int, float)) else "—"
+            ac_str = f"{ac * 100:.1f} %" if isinstance(ac, (int, float)) else "—"
             acc_str = f"{acc * 100:.1f} %"
             if baseline_acc is not None and mode != "baseline":
                 delta = (acc - baseline_acc) * 100
@@ -484,9 +507,11 @@ def _format_table(results: dict) -> str:
                 delta_str = "—"
         else:
             err = data.get("error", "N/A") if isinstance(data, dict) else "N/A"
-            acc_str = f"ERR: {str(err)[:18]}"
+            ae_str = ac_str = "—"
+            acc_str = f"ERR:{str(err)[:6]}"
             delta_str = "N/A"
-        lines.append(f"{mode:<16} {acc_str:>10} {delta_str:>12}")
+        lines.append(f"{mode:<16} {ae_str:>9} {ac_str:>9} "
+                     f"{acc_str:>10} {delta_str:>13}")
 
     lines.append(sep)
     return "\n".join(lines)
