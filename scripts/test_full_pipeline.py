@@ -331,20 +331,82 @@ def _wait_for_health(port: int, timeout: int, name: str) -> bool:
 
 
 def _kill_server(proc: subprocess.Popen, name: str):
-    if proc and proc.poll() is None:
-        print(f"[Server] Stopping {name}...")
+    """Kill vLLM server + ALL descendants (EngineCore, workers, etc.).
+
+    vLLM v1 spawns EngineCore_DP0 and per-worker processes via multiprocessing
+    spawn, which may detach from the original process group. killpg alone
+    can miss these and leak ~30 GiB of GPU memory into the next mode's
+    vLLM init, where the async release then trips vLLM's monotonicity
+    assert. So:
+      1. SIGTERM the API server's process group (graceful path)
+      2. Use psutil to enumerate ALL descendants recursively
+      3. SIGKILL anything still alive
+      4. Also fall back to nvidia-smi for any process holding GPU memory
+         that we spawned (matching --pid of the API server's family)
+    """
+    if not (proc and proc.poll() is None):
+        return
+
+    print(f"[Server] Stopping {name}...")
+    parent_pid = proc.pid
+
+    # Snapshot descendants before any kill (after kill, children get reparented).
+    try:
+        import psutil
+        parent = psutil.Process(parent_pid)
+        descendants = parent.children(recursive=True)
+    except Exception as e:
+        descendants = []
+        print(f"[Server] psutil enumeration failed ({e}); falling back to pgid kill only")
+
+    # Step 1: graceful SIGTERM to whole process group
+    try:
+        pgid = os.getpgid(parent_pid)
+        os.killpg(pgid, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        pass
+    try:
+        proc.wait(timeout=15)
+    except Exception:
+        pass
+
+    # Step 2: SIGKILL any survivors (parent + all original descendants)
+    survivors = []
+    if proc.poll() is None:
         try:
-            pgid = os.getpgid(proc.pid)
-        except OSError:
-            return  # process already dead
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-            proc.wait(timeout=15)
+            proc.kill()
         except Exception:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except Exception:
-                pass
+            pass
+        survivors.append(proc.pid)
+    for d in descendants:
+        try:
+            if d.is_running():
+                d.kill()
+                survivors.append(d.pid)
+        except Exception:
+            pass
+
+    # Step 3: also try pgkill of any stragglers in the group
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (OSError, ProcessLookupError, NameError):
+        pass
+
+    # Step 4: wait for everyone to actually exit
+    if survivors:
+        print(f"[Server] {name}: SIGKILL'd {len(survivors)} processes "
+              f"(parent + descendants)")
+    try:
+        import psutil
+        gone, alive = psutil.wait_procs(
+            [psutil.Process(pid) for pid in survivors if psutil.pid_exists(pid)],
+            timeout=10,
+        )
+        if alive:
+            print(f"[Server] WARNING: {len(alive)} processes still alive after "
+                  f"SIGKILL+wait: {[p.pid for p in alive]}")
+    except Exception:
+        pass
 
 
 def _wait_gpu_free(gpu_id: str, need_mib: int, timeout: int = 180,
@@ -678,6 +740,26 @@ def main():
         print(f"\n{'='*60}")
         print(f"[Pipeline] Mode: {mode}  dir={model_dir}")
         print(f"{'='*60}")
+
+        # Diagnostic: which processes are holding GPU memory right now?
+        # If any are leftover from a prior mode's vLLM, the next init will
+        # likely fail with the free-memory monotonicity assert.
+        try:
+            apps = subprocess.check_output(
+                ["nvidia-smi",
+                 "--query-compute-apps=pid,process_name,used_memory",
+                 "--format=csv,noheader", f"--id={args.gpu}"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            if apps:
+                print(f"[Pipeline] GPU {args.gpu} compute apps before {mode} start:")
+                for line in apps.splitlines():
+                    print(f"[Pipeline]   {line}")
+            else:
+                print(f"[Pipeline] GPU {args.gpu} has no compute apps before "
+                      f"{mode} start (good).")
+        except Exception:
+            pass
 
         proc = None
         try:
