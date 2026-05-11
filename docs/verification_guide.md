@@ -259,3 +259,102 @@ python -m vllm.entrypoints.openai.api_server \
     --model ./opt125m_hifp8 \
     --quantization hif8
 ```
+
+---
+
+## 远程服务器：PTQ demo 与 ARC 评测
+
+无损 PTQ 推荐配置：**SmoothQuant α=0.7 + scale_factor=16 + non-thinking 模式**。
+在 Qwen3-0.6B 上 ARC mean 与 BF16 baseline 持平（55.5% baseline vs 56.5% hif8）。
+
+### 准备环境（远程服务器首次执行）
+
+```bash
+git clone https://github.com/Windere/HiFP8.git && cd HiFP8
+bash setup_env_hifp8_eval.sh       # ~15-25 min，幂等
+conda activate hifp8-eval
+# setup_env_hifp8_eval.sh 已设置 LD_LIBRARY_PATH；若新开 shell：
+export LD_LIBRARY_PATH="$(python -c 'import torch,os; print(os.path.join(os.path.dirname(torch.__file__),"lib"))'):$LD_LIBRARY_PATH"
+```
+
+### Demo B：side-by-side 答案对比（~10 min）
+
+最直观的 demo——对一组 demo 问题，并排展示 BF16 baseline 和 HiFP8 w8a8 的输出，
+完全相同的算 MATCH。无需手动指定模型路径，自动从 HuggingFace 下载：
+
+```bash
+PYTHONPATH=$(pwd):$(pwd)/ao \
+python scripts/demo_nothink_compare.py \
+    --model Qwen/Qwen3-0.6B \
+    --gpu 0 \
+    --out-dir outputs/demo_compare
+```
+
+脚本会：
+1. 首次运行下载 `Qwen/Qwen3-0.6B` 到 HF cache（~1 GB），重跑则跳过
+2. 量化导出 hif8 checkpoint 到 `outputs/demo_compare/hif8/`（缓存，重跑跳过）
+3. 顺序起两个 vLLM server（同 GPU），对 10 条 demo prompts 用
+   `temperature=0` + `enable_thinking=false` 查询
+4. 打印 side-by-side 表 + match 计数；完整 JSON 写到 `outputs/demo_compare/demo_results.json`
+
+加 `--force-reexport` 强制重新量化（改 alpha / scale_factor 后用）。
+
+### Demo C：完整 ARC 评测（~25 min）
+
+用 `evalscope` 跑 ARC-Easy + ARC-Challenge 各 100 题，输出量化前后的精度对比表。
+这是 README 的标准 benchmark：
+
+```bash
+PYTHONUNBUFFERED=1 PYTHONPATH=$(pwd):$(pwd)/ao \
+python scripts/test_full_pipeline.py \
+    --model Qwen/Qwen3-0.6B \
+    --output-dir outputs/arc_demo \
+    --modes baseline,hif8 \
+    --smooth-quant \
+    --no-thinking \
+    --gpu 0 \
+    --gpu-memory-utilization 0.5 \
+    --port 8090
+# default 已是 --scale-factor 16.0 --smooth-alpha 0.7（无需显式指定）
+```
+
+完成后查看：
+
+```bash
+cat outputs/arc_demo/results.json
+# 或两个详细报告：
+cat outputs/arc_demo/arc_results/baseline/reports/baseline/arc.json
+cat outputs/arc_demo/arc_results/hif8/reports/hif8/arc.json
+```
+
+期望结果（Qwen3-0.6B，limit=100/subset）：
+
+| Mode | ARC-Easy | ARC-Challenge | Mean | vs baseline |
+|------|----------|---------------|------|-------------|
+| baseline | ~0.64 | ~0.48 | ~0.56 | — |
+| hif8 (sf=16, α=0.7) | ~0.62 | ~0.51 | ~0.565 | ~0 pp（统计噪声内） |
+
+### 切换到其他模型
+
+`--model` 接受任何 HuggingFace 模型 ID 或本地路径。0.6B-2B 推荐 demo 用，
+更大的模型注意调整 `--gpu-memory-utilization`：
+
+```bash
+# 1.5B 模型，单卡 80GB
+python scripts/test_full_pipeline.py --model Qwen/Qwen3-1.5B \
+    --smooth-quant --no-thinking --gpu-memory-utilization 0.5 ...
+
+# 7B 模型，单卡 80GB
+python scripts/test_full_pipeline.py --model Qwen/Qwen3-7B-Instruct \
+    --smooth-quant --no-thinking --gpu-memory-utilization 0.7 ...
+```
+
+### 常见问题
+
+| 现象 | 原因 | 解 |
+|---|---|---|
+| `OSError: libc10.so` 加载失败 | torch shared lib 不在 LD_LIBRARY_PATH | 用 setup_env_hifp8_eval.sh 或手工 export |
+| vLLM 启动 600s 超时 | 第一次下载/编译 / GPU 内存争抢 | 看 `outputs/.../logs/vllm_*.log`；降低 `--gpu-memory-utilization` |
+| hif8 server `Dynamo cannot trace` | torch.compile 试图 trace 自定义 CUDA kernel | 已默认 `--enforce-eager`；如自定义命令注意加上 |
+| baseline 答案带 `<think>` 标签 | `enable_thinking=false` 未到 vLLM | 确认请求体里有 `chat_template_kwargs={"enable_thinking": false}` |
+| 远程下载慢 | HF 国内不通 | 设置 `HF_ENDPOINT=https://hf-mirror.com` 或预先 `huggingface-cli download` |
