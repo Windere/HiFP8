@@ -74,13 +74,76 @@ def parse_args() -> argparse.Namespace:
 
 
 CALIBRATION_PROMPTS = [
+    # Factual / science
+    "What is the boiling point of water at sea level?",
+    "Which planet is closest to the Sun?",
+    "What gas do plants absorb during photosynthesis?",
+    "How many bones are in the adult human body?",
+    "What is the chemical formula for table salt?",
+    "What force keeps planets in orbit around the Sun?",
+    "Which element has the atomic number 1?",
+    "What is the speed of light in a vacuum?",
+    # Math / logic
+    "If a train travels at 60 mph for 2.5 hours, how far does it travel?",
+    "What is the square root of 144?",
+    "A rectangle has length 8 and width 5. What is its area?",
+    "If 3x + 7 = 22, what is the value of x?",
+    # History / geography
+    "In what year did the First World War begin?",
+    "What is the capital city of Australia?",
+    "Which ocean is the largest by area?",
+    "Who wrote the play Romeo and Juliet?",
+    # Common sense / everyday
+    "Why does ice float on water?",
+    "What causes the seasons on Earth?",
+    "Why do we see lightning before we hear thunder?",
+    "What is the main function of red blood cells?",
+    # Original prompts (general language distribution)
     "The quick brown fox jumps over the lazy dog.",
     "In 2024, artificial intelligence made significant advances in reasoning.",
     "Quantization reduces model size by representing weights with fewer bits.",
     "The transformer architecture revolutionized natural language processing.",
     "Large language models are trained on vast amounts of text data.",
     "Scientific research requires careful experimental design and analysis.",
+    # Reading comprehension style
+    "The mitochondria is the powerhouse of the cell. What organelle produces energy?",
+    "Mammals are warm-blooded vertebrates. Are humans mammals?",
+    "A herbivore eats only plants. What does a carnivore eat?",
+    "Water expands when it freezes. Does ice take up more or less space than liquid water?",
+    "The equator divides Earth into northern and southern hemispheres.",
+    "Photosynthesis converts light energy into chemical energy stored in glucose.",
 ]
+
+
+def _build_calib_inputs(tokenizer, prompts: list, device: str = "cuda:0",
+                        use_chat_template: bool = True) -> list:
+    """Tokenize calibration prompts, optionally applying Qwen3 chat template.
+
+    Using the chat template (with enable_thinking=False) aligns calibration
+    activations with the inference distribution: ARC evaluation sends chat-
+    formatted requests with enable_thinking=False, producing a prefix that
+    includes the <|im_start|>/<|im_end|>/<think></think> special tokens.
+    SmoothQuant smooth scales computed from matching-distribution activations
+    are more effective than scales from plain-text tokenization.
+    """
+    encoded = []
+    for p in prompts:
+        if use_chat_template and hasattr(tokenizer, "apply_chat_template"):
+            try:
+                # enable_thinking=False matches the ARC evaluation format
+                text = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": p}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            except Exception:
+                text = p
+        else:
+            text = p
+        encoded.append(tokenizer(text, return_tensors="pt",
+                                 truncation=True, max_length=512))
+    return encoded
 
 
 def _quantize_model(model_path: str, scale_factor: float = 1.0,
@@ -112,8 +175,10 @@ def _quantize_model(model_path: str, scale_factor: float = 1.0,
         from quantization.smooth import calibrate_and_smooth
         from quantization.smooth_fuse import fuse_smooth_into_norms, rollback_unfoldable_smooths
 
-        print("[SmoothQuant] Building calibration dataloader from fixed prompts...")
-        encoded = [tokenizer(p, return_tensors="pt") for p in CALIBRATION_PROMPTS]
+        print(f"[SmoothQuant] Building calibration dataloader "
+              f"({len(CALIBRATION_PROMPTS)} chat-format prompts, enable_thinking=False)...")
+        encoded = _build_calib_inputs(tokenizer, CALIBRATION_PROMPTS,
+                                      device="cuda:0", use_chat_template=True)
 
         class _SimpleLoader:
             def __iter__(self):
@@ -128,12 +193,6 @@ def _quantize_model(model_path: str, scale_factor: float = 1.0,
         rollback_unfoldable_smooths(model)
         print("[SmoothQuant] Done.")
 
-    print("[Quantize] Calibrating with fixed prompts...")
-    model.train()
-    with torch.no_grad():
-        for prompt in CALIBRATION_PROMPTS:
-            inputs = tokenizer(prompt, return_tensors="pt").to("cuda:0")
-            model(**inputs)
     model.eval()
     print("[Quantize] Done.")
     return model, tokenizer
