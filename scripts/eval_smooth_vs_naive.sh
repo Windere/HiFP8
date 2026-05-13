@@ -64,9 +64,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-OUT_NAIVE="outputs/qwen3_ptq_weightonly"
-OUT_SMOOTH="outputs/qwen3_ptq_smooth_fused"
-LOG_DIR="outputs/logs"
+OUT_NAIVE="${HOME}/outputs/HiFP8/qwen3_ptq_weightonly"
+OUT_SMOOTH="${HOME}/outputs/HiFP8/qwen3_ptq_smooth_fused"
+LOG_DIR="${HOME}/outputs/HiFP8/logs"
 mkdir -p "${LOG_DIR}"
 
 echo "════════════════════════════════════════════════════════════"

@@ -37,6 +37,7 @@ import urllib.request
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
+_OUTPUT_ROOT = Path.home() / "outputs" / "HiFP8"
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "ao"))
 
@@ -258,7 +259,7 @@ def main():
     ap.add_argument("--port-base", type=int, default=8100,
                     help="Sequential ports used: port-base (baseline), "
                          "port-base+1 (hif8). Default: 8100/8101.")
-    ap.add_argument("--out-dir", default="outputs/demo_compare",
+    ap.add_argument("--out-dir", default=str(_OUTPUT_ROOT / "demo_compare"),
                     help="Where to put the hif8 export and logs.")
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.4,
                     help="vLLM --gpu-memory-utilization (default 0.4).")
@@ -278,7 +279,7 @@ def main():
             print(f"[demo]   Active vLLM: {_vllm_pkg.__file__} ({_vllm_pkg.__version__})")
             print(f"[demo]   Registered: {sorted(QUANTIZATION_METHODS.keys())}")
             print(f"[demo] Fix: pip uninstall -y vllm && bash setup_env_hifp8_eval.sh")
-            print(f"[demo]   (or pip install -e outputs/vendor/vllm-hifp8-fork)")
+            print(f"[demo]   (or pip install -e {_OUTPUT_ROOT}/vendor/vllm-hifp8-fork)")
             sys.exit(2)
     except ImportError as e:
         print(f"\n[demo] FATAL: cannot import vllm: {e}")

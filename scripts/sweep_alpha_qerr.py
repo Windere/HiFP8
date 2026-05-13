@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
+_OUTPUT_ROOT = Path.home() / "outputs" / "HiFP8"
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
@@ -147,7 +148,7 @@ def main():
                         help="Comma-separated scale_factor values (one row per alpha x sf)")
     parser.add_argument("--include-weight-only", action="store_true",
                         help="Also measure w8a16 baseline (weight-only quantization)")
-    parser.add_argument("--output", default="outputs/sweep_alpha_qerr.json")
+    parser.add_argument("--output", default=str(_OUTPUT_ROOT / "sweep_alpha_qerr.json"))
     parser.add_argument("--gpu", default="0")
     args = parser.parse_args()
 

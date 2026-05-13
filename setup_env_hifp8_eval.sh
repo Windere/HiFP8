@@ -16,8 +16,9 @@ set -euo pipefail
 
 ENV_NAME="${HIFP8_ENV_NAME:-hifp8-eval}"
 WORKSPACE="$(cd "$(dirname "$0")" && pwd)"
-LOG_DIR="${WORKSPACE}/outputs/logs"
-VENDOR_DIR="${WORKSPACE}/outputs/vendor"
+OUTPUT_ROOT="${HOME}/outputs/HiFP8"
+LOG_DIR="${OUTPUT_ROOT}/logs"
+VENDOR_DIR="${OUTPUT_ROOT}/vendor"
 VLLM_FORK_DIR="${VENDOR_DIR}/vllm-hifp8-fork"
 
 # Auto-detect conda root. Priority: $CONDA_ROOT env → `conda info --base` →
@@ -155,7 +156,7 @@ print(f"  api_server   : importable")
 print(f"  hifp8 kernel : OK ({h.__file__.split('/')[-1]})")
 PY
 
-mkdir -p "${WORKSPACE}/outputs"
-touch "${WORKSPACE}/outputs/.phase_1_done"
+mkdir -p "${OUTPUT_ROOT}"
+touch "${OUTPUT_ROOT}/.phase_1_done"
 echo "[setup] ✅ Phase 1 done — env ${ENV_NAME} ready."
 echo "[setup] Activate with: conda activate ${ENV_NAME}"

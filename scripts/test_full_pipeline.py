@@ -21,6 +21,7 @@ import urllib.request
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
+_OUTPUT_ROOT = Path.home() / "outputs" / "HiFP8"
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "ao"))
 
@@ -28,7 +29,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "ao"))
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="HiFP8 full pipeline test")
     p.add_argument("--model", required=True, help="Model path or HuggingFace ID")
-    p.add_argument("--output-dir", default="./outputs/pipeline_test",
+    p.add_argument("--output-dir", default=str(_OUTPUT_ROOT / "pipeline_test"),
                    help="Root dir for exports and results")
     p.add_argument("--arc-n", type=int, default=100,
                    help="Cap on questions PER ARC subset (default: 100 per "
@@ -780,9 +781,9 @@ def main():
                 print(f"[Pipeline] Fix: install the XiangWanggithub/vllm fork:")
                 print(f"[Pipeline]   pip uninstall -y vllm && \\")
                 print(f"[Pipeline]   bash setup_env_hifp8_eval.sh   # idempotent")
-                print(f"[Pipeline] Or, if outputs/vendor/vllm-hifp8-fork/ already "
+                print(f"[Pipeline] Or, if {_OUTPUT_ROOT}/vendor/vllm-hifp8-fork/ already "
                       f"exists:")
-                print(f"[Pipeline]   pip install -e outputs/vendor/vllm-hifp8-fork")
+                print(f"[Pipeline]   pip install -e {_OUTPUT_ROOT}/vendor/vllm-hifp8-fork")
                 sys.exit(2)
         except ImportError as e:
             print(f"\n[Pipeline] FATAL: cannot import vllm: {e}")

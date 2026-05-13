@@ -22,6 +22,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_OUTPUT_ROOT = Path.home() / "outputs" / "HiFP8"
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 sys.path.insert(0, os.path.join(_REPO_ROOT, "custom_ops"))
@@ -32,11 +33,11 @@ from custom_ops.hifp8_ops import hifp8_fake_quantize
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
-    ap.add_argument("--output", default="outputs/qwen3_ptq_weightonly")
+    ap.add_argument("--output", default=str(_OUTPUT_ROOT / "qwen3_ptq_weightonly"))
     args = ap.parse_args()
 
     device = "cuda"
-    log_path = Path("outputs/logs/phase_3c_ptq_weightonly.log")
+    log_path = _OUTPUT_ROOT / "logs" / "phase_3c_ptq_weightonly.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     def log(msg):
