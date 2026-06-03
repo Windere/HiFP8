@@ -1,152 +1,130 @@
 #!/usr/bin/env bash
-# Bootstrap the hifp8-eval conda environment for the QAT pipeline.
-# Idempotent: re-runs are safe (skip already-done steps).
+# Bootstrap the hifp8-eval conda environment.
+# Idempotent: re-runs are safe.
 #
-# Hardware assumed:
-#   * NVIDIA GPU with compute capability ≥ 7.5 (Turing+); tested on RTX 5090
-#   * NVIDIA driver supporting CUDA 12.8 runtime (≥ 525.x)
-#   * /usr/local/cuda or compatible CUDA toolkit on PATH for nvcc
+# Hardware: NVIDIA GPU (Turing+), CUDA 12.8 runtime, nvcc on PATH.
 #
 # Environment variables (override defaults):
-#   HIFP8_ENV_NAME   — conda env name (default: hifp8-eval)
-#   CONDA_ROOT       — conda base dir  (auto-detected if not set)
+#   HIFP8_ENV_NAME   — conda env name  (default: hifp8-eval)
+#   CONDA_ROOT       — conda base dir  (auto-detected)
 #   HIFP8_TORCH_VER  — torch version   (default: 2.9.0)
-#   HIFP8_TORCH_INDEX— torch wheel idx (default: cu128)
+#   HIFP8_TORCH_INDEX— torch index URL (default: cu128)
 set -euo pipefail
 
 ENV_NAME="${HIFP8_ENV_NAME:-hifp8-eval}"
 WORKSPACE="$(cd "$(dirname "$0")" && pwd)"
 OUTPUT_ROOT="${HOME}/outputs/HiFP8"
 LOG_DIR="${OUTPUT_ROOT}/logs"
-VENDOR_DIR="${OUTPUT_ROOT}/vendor"
-VLLM_FORK_DIR="${VENDOR_DIR}/vllm-hifp8-fork"
+VLLM_DIR="${HOME}/Mem/vllm-hifp8"   # XiangWanggithub/vllm v0.12.0 fork
 
-# Auto-detect conda root. Priority: $CONDA_ROOT env → `conda info --base` →
-# common locations. Set CONDA_ROOT explicitly to override.
+# ---------------------------------------------------------------------------
+# Conda detection
+# ---------------------------------------------------------------------------
 if [ -z "${CONDA_ROOT:-}" ]; then
-    if command -v conda >/dev/null 2>&1; then
-        CONDA_ROOT="$(conda info --base 2>/dev/null || true)"
-    fi
+    command -v conda >/dev/null 2>&1 && CONDA_ROOT="$(conda info --base 2>/dev/null || true)"
     if [ -z "${CONDA_ROOT:-}" ]; then
-        for _cand in "${HOME}/miniconda3" "${HOME}/anaconda3" \
-                     "/opt/miniconda3" "/opt/anaconda3" \
-                     "/opt/conda" "/usr/local/miniconda3"; do
-            if [ -f "${_cand}/etc/profile.d/conda.sh" ]; then
-                CONDA_ROOT="${_cand}"
-                break
-            fi
+        for _c in "${HOME}/miniconda3" "${HOME}/anaconda3" \
+                  "/opt/conda" "/opt/miniconda3" "/opt/anaconda3" "/usr/local/miniconda3"; do
+            [ -f "${_c}/etc/profile.d/conda.sh" ] && { CONDA_ROOT="${_c}"; break; }
         done
     fi
 fi
-if [ -z "${CONDA_ROOT:-}" ] || [ ! -f "${CONDA_ROOT}/etc/profile.d/conda.sh" ]; then
-    echo "[setup] ERROR: conda not found. Searched \$CONDA_ROOT, 'conda info --base'," \
-         "and common locations. Set CONDA_ROOT=/path/to/miniconda3 explicitly." >&2
-    exit 1
-fi
-echo "[setup] Using CONDA_ROOT=${CONDA_ROOT}"
-mkdir -p "${LOG_DIR}" "${VENDOR_DIR}"
-
+[ -z "${CONDA_ROOT:-}" ] || [ ! -f "${CONDA_ROOT}/etc/profile.d/conda.sh" ] && {
+    echo "[setup] ERROR: conda not found. Set CONDA_ROOT=/path/to/miniconda3" >&2; exit 1
+}
+mkdir -p "${LOG_DIR}"
 source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+log() { echo "[setup] $*" | tee -a "${LOG_DIR}/setup.log"; }
+log "CONDA_ROOT=${CONDA_ROOT}"
 
-run_log() { echo "$@" | tee -a "${LOG_DIR}/setup.log" >&2; }
-
-# 1) create env if missing
-if ! conda env list | grep -qE "^${ENV_NAME}\s"; then
-    run_log "[setup] Creating conda env ${ENV_NAME} (python=3.12)..."
+# ---------------------------------------------------------------------------
+# 1) Conda env
+# ---------------------------------------------------------------------------
+if ! conda env list | grep -qE "^${ENV_NAME}[[:space:]]"; then
+    log "Creating conda env ${ENV_NAME} (python=3.12)..."
     conda create -y -n "${ENV_NAME}" python=3.12 2>&1 | tee -a "${LOG_DIR}/setup.log"
 else
-    run_log "[setup] Env ${ENV_NAME} already exists, reusing."
+    log "Env ${ENV_NAME} already exists."
 fi
 conda activate "${ENV_NAME}"
 
-# Ensure torch shared libs are findable at import time.
-# conda activate does not add site-packages/torch/lib to LD_LIBRARY_PATH;
-# without this, any python -c "import hifp8_cuda_uint8" fails with
-# "libc10.so: cannot open shared object file".
-_set_torch_ldpath() {
-    local torch_lib
-    torch_lib=$(python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__),'lib'))" 2>/dev/null)
-    if [ -n "${torch_lib}" ] && [ -d "${torch_lib}" ]; then
-        export LD_LIBRARY_PATH="${torch_lib}:${LD_LIBRARY_PATH:-}"
-        run_log "[setup] LD_LIBRARY_PATH += ${torch_lib}"
-    fi
-}
-
-# 2) torch 2.9.0 + cu128 — matches RTX 5090 driver 570.x (CUDA 12.8 runtime).
-# torch 2.11.0+cu130 needs driver ≥ CUDA 13, which most production hosts
-# don't have yet. Override HIFP8_TORCH_* env vars to use a different combo.
+# ---------------------------------------------------------------------------
+# 2) PyTorch cu128 — matches RTX 5090 / CUDA 12.8 runtime.
+# ---------------------------------------------------------------------------
 TORCH_VER="${HIFP8_TORCH_VER:-2.9.0}"
-TORCHVISION_VER="${HIFP8_TORCHVISION_VER:-0.24.0}"
 TORCH_INDEX="${HIFP8_TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
-run_log "[setup] Installing torch==${TORCH_VER} torchvision==${TORCHVISION_VER} from ${TORCH_INDEX}..."
-python -m pip install --quiet \
-    "torch==${TORCH_VER}" "torchvision==${TORCHVISION_VER}" \
-    --extra-index-url "${TORCH_INDEX}" \
+log "Installing torch==${TORCH_VER} (cu128)..."
+pip install --quiet "torch==${TORCH_VER}" "torchvision==0.24.0" \
+    --extra-index-url "${TORCH_INDEX}" 2>&1 | tee -a "${LOG_DIR}/setup.log"
+
+# Persist torch lib path so every future `conda activate` finds libc10.so.
+# Without this, importing hifp8_cuda_uint8 fails with "libc10.so not found".
+TORCH_LIB=$(python -c "import torch,os; print(os.path.join(os.path.dirname(torch.__file__),'lib'))")
+ACTIVATE_D="${CONDA_ROOT}/envs/${ENV_NAME}/etc/conda/activate.d"
+mkdir -p "${ACTIVATE_D}"
+printf 'export LD_LIBRARY_PATH="%s:${LD_LIBRARY_PATH:-}"\n' "${TORCH_LIB}" \
+    > "${ACTIVATE_D}/hifp8_ldpath.sh"
+export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+log "LD_LIBRARY_PATH += ${TORCH_LIB} (persisted to activate.d)"
+
+# ---------------------------------------------------------------------------
+# 3) Core deps + evalscope
+# ---------------------------------------------------------------------------
+log "Installing core deps..."
+pip install --quiet \
+    transformers datasets accelerate sentencepiece numpy \
+    en-dtypes torchao pytest evalscope \
     2>&1 | tee -a "${LOG_DIR}/setup.log"
-_set_torch_ldpath
 
-# 3) HiFP8 modeling stack
-run_log "[setup] Installing transformers / datasets / accelerate / sentencepiece / en-dtypes / torchao..."
-python -m pip install --quiet \
-    transformers datasets accelerate sentencepiece numpy en-dtypes pytest torchao \
-    2>&1 | tee -a "${LOG_DIR}/setup.log"
-
-# 4) evalscope (used by the 4-way evaluation phase)
-run_log "[setup] Installing evalscope..."
-python -m pip install --quiet evalscope 2>&1 | tee -a "${LOG_DIR}/setup.log"
-
-# 5) Build HiFP8 CUDA kernel in this env (needs nvcc on PATH)
-run_log "[setup] Building HiFP8 CUDA kernel..."
+# ---------------------------------------------------------------------------
+# 4) HiFP8 CUDA kernel
+# ---------------------------------------------------------------------------
+log "Building HiFP8 CUDA kernel..."
 (cd "${WORKSPACE}/custom_ops" && python setup_cuda.py build_ext --inplace) \
     2>&1 | tee -a "${LOG_DIR}/setup.log"
-python -c "import sys; sys.path.insert(0,'custom_ops'); import hifp8_cuda_uint8; print('  hifp8 kernel build OK')" \
-    2>&1 | tee -a "${LOG_DIR}/setup.log"
+python -c "
+import sys; sys.path.insert(0, '${WORKSPACE}/custom_ops')
+import hifp8_cuda_uint8 as h
+print('  kernel OK:', h.__file__.split('/')[-1])
+" 2>&1 | tee -a "${LOG_DIR}/setup.log"
 
-# 6) vLLM fork — clone v0.12.0 + install editable.
-# IMPORTANT: vLLM's setup.py only declares CORE deps; many run-time deps
-# referenced from vllm.entrypoints.openai.api_server (uvloop, fastapi,
-# prometheus-fastapi-instrumentator, model_hosting_container_standards,
-# numba, llvmlite, ...) are NOT pulled by `pip install -e .` and must be
-# added via requirements/common.txt + a few extras (next step), otherwise
-# you'll hit ModuleNotFoundError at server start time.
-if [ ! -d "${VLLM_FORK_DIR}/.git" ]; then
-    run_log "[setup] Cloning XiangWanggithub/vllm v0.12.0 fork → ${VLLM_FORK_DIR}..."
-    git clone -b v0.12.0 https://github.com/XiangWanggithub/vllm.git "${VLLM_FORK_DIR}" \
+# ---------------------------------------------------------------------------
+# 5) vLLM fork (uses ~/Mem/vllm-hifp8; clones only if missing)
+# ---------------------------------------------------------------------------
+if [ ! -d "${VLLM_DIR}/.git" ]; then
+    log "Cloning XiangWanggithub/vllm v0.12.0 → ${VLLM_DIR}..."
+    git clone -b v0.12.0 https://github.com/XiangWanggithub/vllm.git "${VLLM_DIR}" \
         2>&1 | tee -a "${LOG_DIR}/setup.log"
 else
-    run_log "[setup] vLLM fork already cloned at ${VLLM_FORK_DIR}, reusing."
+    log "vLLM fork found at ${VLLM_DIR}."
 fi
 
-run_log "[setup] pip install -e vllm fork (5-10 min)..."
-python -m pip install --quiet -e "${VLLM_FORK_DIR}" 2>&1 | tee -a "${LOG_DIR}/setup.log"
+log "pip install -e vllm fork (compiles CUDA extensions, ~5-10 min)..."
+pip install --quiet -e "${VLLM_DIR}" 2>&1 | tee -a "${LOG_DIR}/setup.log"
 
-run_log "[setup] Installing vLLM common.txt requirements (large set, 5-10 min)..."
-python -m pip install --quiet -r "${VLLM_FORK_DIR}/requirements/common.txt" \
+log "Installing vLLM runtime deps (requirements/common.txt)..."
+pip install --quiet -r "${VLLM_DIR}/requirements/common.txt" \
     2>&1 | tee -a "${LOG_DIR}/setup.log"
 
-run_log "[setup] Installing vLLM run-time extras not covered by common.txt..."
-python -m pip install --quiet --no-deps \
-    numba llvmlite model_hosting_container_standards \
-    uvloop uvicorn cachetools openai partial-json-parser msgspec gguf \
-    httpx aiohttp depyf opentelemetry-api opentelemetry-sdk lark pillow blake3 \
-    outlines compressed-tensors py-cpuinfo pybase64 prometheus_client pyzmq \
-    setproctitle tiktoken watchfiles xgrammar ray pydantic \
-    2>&1 | tee -a "${LOG_DIR}/setup.log"
-# cloudpickle is a Ray/vLLM serialization dep (substring "pickle" in the name
-# is benign — we don't unpickle untrusted data ourselves).
-__VLLM_EXTRA_2="cloud""pickle"
-python -m pip install --quiet --no-deps "${__VLLM_EXTRA_2}" \
+# Extras not covered by common.txt
+log "Installing extras not in common.txt..."
+pip install --quiet \
+    uvloop model_hosting_container_standards \
+    opentelemetry-api opentelemetry-sdk \
     2>&1 | tee -a "${LOG_DIR}/setup.log"
 
-# 7) smoke test — every import below MUST succeed before phase 1 is "done"
-run_log "[setup] Smoke test (torch / transformers / datasets / evalscope / vllm / hifp8 kernel)..."
-python - <<'PY' 2>&1 | tee -a "${LOG_DIR}/setup.log"
+# ---------------------------------------------------------------------------
+# 6) Smoke test
+# ---------------------------------------------------------------------------
+log "Running smoke test..."
+CUSTOM_OPS="${WORKSPACE}/custom_ops"
+python - <<PY 2>&1 | tee -a "${LOG_DIR}/setup.log"
 import sys, torch, transformers, datasets, evalscope
-sys.path.insert(0, "custom_ops")
+sys.path.insert(0, "${CUSTOM_OPS}")
 import hifp8_cuda_uint8 as h
 import vllm
-from vllm.entrypoints.openai import api_server  # the import that broke earlier
-assert torch.cuda.is_available(), "CUDA not available — check NVIDIA driver / nvidia-smi"
+from vllm.entrypoints.openai import api_server
+assert torch.cuda.is_available(), "CUDA not available — check nvidia-smi"
 print(f"  torch        : {torch.__version__} (cuda={torch.version.cuda})")
 print(f"  transformers : {transformers.__version__}")
 print(f"  datasets     : {datasets.__version__}")
@@ -156,7 +134,5 @@ print(f"  api_server   : importable")
 print(f"  hifp8 kernel : OK ({h.__file__.split('/')[-1]})")
 PY
 
-mkdir -p "${OUTPUT_ROOT}"
 touch "${OUTPUT_ROOT}/.phase_1_done"
-echo "[setup] ✅ Phase 1 done — env ${ENV_NAME} ready."
-echo "[setup] Activate with: conda activate ${ENV_NAME}"
+log "Done. conda activate ${ENV_NAME}"
